@@ -11,6 +11,7 @@ High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architec
   - **Cold Workers:** Spawns on-demand subprocesses when the GPU is busy, ensuring that long audio files don't block quick voice commands.
 - **OpenAI Compatible:** Polymorphic endpoint `/v1/audio/transcriptions` supporting standard parameters (`language`, `prompt`, `temperature`, `response_format`).
 - **Hardware Accelerated:** Designed to squeeze maximum performance from NVIDIA GPUs.
+- **Production-Ready Concurrency:** Unlike simple batch scripts that transcribe files one by one, this server is an infrastructure-grade orchestrator that manages hardware locks and scales to handle multiple simultaneous requests without crashing or blocking the primary user.
 - **Privacy First:** 100% local execution. Your data never leaves your infrastructure.
 
 ## 📦 Requirements
