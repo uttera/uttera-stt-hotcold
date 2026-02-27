@@ -9,7 +9,7 @@ High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architec
 - **Hybrid Concurrency:**
   - **Hot Worker:** Keeps a Whisper model resident in VRAM for sub-second (0.2s) inference.
   - **Cold Workers:** Spawns on-demand subprocesses when the GPU is busy, ensuring that long audio files don't block quick voice commands.
-- **OpenAI Compatible:** Polimorphic endpoint `/v1/audio/transcriptions` supporting standard parameters (`language`, `prompt`, `temperature`, `response_format`).
+- **OpenAI Compatible:** Polymorphic endpoint `/v1/audio/transcriptions` supporting standard parameters (`language`, `prompt`, `temperature`, `response_format`).
 - **Hardware Accelerated:** Designed to squeeze maximum performance from NVIDIA GPUs.
 - **Privacy First:** 100% local execution. Your data never leaves your infrastructure.
 
@@ -26,10 +26,6 @@ High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architec
 To run the server manually for testing or development:
 
 ```bash
-# Set environment variables (optional)
-export WHISPER_MODEL=medium
-export DEBUG=false
-
 # Execute using Uvicorn
 uvicorn main_stt:app --host 0.0.0.0 --port 5000
 ```
@@ -50,7 +46,6 @@ Type=simple
 User=root
 WorkingDirectory=/usr/local/lib/whisper
 Environment="WHISPER_MODEL=medium"
-Environment="DEBUG=false"
 Environment="XDG_CACHE_HOME=/opt/ai/models/speech"
 ExecStart=/usr/local/lib/whisper/bin/python -m uvicorn main_stt:app --host 0.0.0.0 --port 5000
 Restart=always
@@ -66,6 +61,24 @@ sudo systemctl daemon-reload
 sudo systemctl enable whisper-stt
 sudo systemctl start whisper-stt
 ```
+
+## 🔍 Debugging & Monitoring
+
+The server includes a specialized debug mode for performance monitoring and troubleshooting.
+
+### Enable Debug Mode
+Set the environment variable `DEBUG=true` when starting the server:
+
+```bash
+DEBUG=true uvicorn main_stt:app --host 0.0.0.0 --port 5000
+```
+
+### What does Debug Mode provide?
+- **Worker Routing:** Shows in real-time whether a request is handled by the **Fast Lane** (in-memory GPU) or the **Child Lane** (on-demand subprocess).
+- **Command Visibility:** Prints the exact shell command passed to the Whisper binary, including all parameters (`--language`, `--initial_prompt`, `--temperature`, etc.).
+- **Cleanup Traces:** Confirms the deletion of temporary files after processing.
+
+By default (if `DEBUG` is unset or not `true`), the server only outputs standard Uvicorn access logs (`INFO: ... 200 OK`), keeping your console clean for production use.
 
 ## 📊 Performance Benchmarks (Sphinx GPU)
 
