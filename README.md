@@ -1,4 +1,4 @@
-# whisper-hybrid-router
+# whisper-stt-local-server
 
 High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architecture. Optimized for single-GPU setups where low latency and high availability are critical.
 
