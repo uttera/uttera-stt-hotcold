@@ -15,7 +15,7 @@
 #
 # Package: whisper-stt-server
 # Version: 1.2.3
-# Maintainer: Uttera <>, Hugo Espuny <>
+# Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
