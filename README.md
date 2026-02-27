@@ -20,6 +20,20 @@ High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architec
 - **FFmpeg:** Required for audio processing.
 - **NVIDIA GPU:** For hardware acceleration (CUDA).
 - **Python 3.10+**
+- **Uvicorn & FastAPI:** The server requires these libraries to handle HTTP traffic.
+
+## ⚙️ Setup & Dependencies
+
+It is highly recommended to install the dependencies within a virtual environment.
+
+```bash
+# 1. Create a virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# 2. Install core requirements
+pip install openai-whisper fastapi uvicorn
+```
 
 ## 🛠 Installation
 
