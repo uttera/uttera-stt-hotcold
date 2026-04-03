@@ -39,8 +39,9 @@ MODEL_NAME="${WHISPER_MODEL:-medium}"
 $PYTHON_BIN - <<EOF
 import whisper, os
 cache = os.path.join("$MODELS_DIR", "whisper")
-print(f"    -> Downloading/verifying model '{MODEL_NAME}' to {cache}...")
-whisper.load_model("$MODEL_NAME", download_root=cache)
+model = "$MODEL_NAME"
+print(f"    -> Downloading/verifying model '{model}' to {cache}...")
+whisper.load_model(model, download_root=cache)
 print("    [✓] Model ready.")
 EOF
 
