@@ -1,5 +1,9 @@
 # whisper-stt-local-server
 
+<p align="center">
+  <img src="docs/img/social-preview.jpg" alt="Whisper STT Local Server" width="800">
+</p>
+
 High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architecture.
 
 **Ideal for locally running installations of agents like OpenClaw or Open-WebUI, where the media should not leave the private local domain.**
