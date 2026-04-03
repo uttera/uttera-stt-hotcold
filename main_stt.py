@@ -14,11 +14,12 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.3.4
+# Version: 1.3.5
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.3.5 (2026-04-03): VENV_PYTHON and WHISPER_SCRIPT auto-detect local venv/bin/ relative to BASE_DIR before falling back to hardcoded sphinx paths.
 # - 1.3.4 (2026-04-03): MODEL_CACHE_DIR defaults to project-relative assets/models/whisper (no-sudo, no /opt). Mirrors coqui BASE_DIR pattern.
 # - 1.3.3 (2026-04-03): VENV_PYTHON and WHISPER_SCRIPT now read from env vars (VENV_PYTHON, WHISPER_SCRIPT) with hardcoded values as fallback.
 # - 1.3.2 (2026-04-03): Cold Lane refactored to asyncio.create_subprocess_exec + asyncio.wait_for. Adds COLD_LANE_TIMEOUT_SECONDS env var (default 300s). Prevents hung subprocesses from blocking indefinitely.
@@ -52,17 +53,31 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.3.4"
+SERVER_VERSION = "1.3.5"
 
 # BASE_DIR is the directory containing this script. All local paths are relative to it,
 # allowing no-sudo installation as any user (mirrors coqui-tts-local-server pattern).
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 
-# VENV_PYTHON and WHISPER_SCRIPT are configurable via env vars (set in .env).
-# The hardcoded values below are the fallback for the canonical sphinx installation.
-VENV_PYTHON = os.environ.get("VENV_PYTHON", "/usr/local/lib/whisper/bin/python")
-WHISPER_SCRIPT = os.environ.get("WHISPER_SCRIPT", "/usr/local/lib/whisper/bin/whisper")
+# VENV_PYTHON and WHISPER_SCRIPT: resolution order:
+#   1. VENV_PYTHON / WHISPER_SCRIPT env vars (explicit override via .env)
+#   2. Auto-detected local venv at BASE_DIR/venv/bin/ (project-relative install)
+#   3. Hardcoded fallback for the canonical sphinx installation (/usr/local/lib/whisper)
+def _find_in_venv(rel_path: str) -> str:
+    candidate = os.path.join(BASE_DIR, rel_path)
+    return candidate if os.path.exists(candidate) else None
+
+VENV_PYTHON = (
+    os.environ.get("VENV_PYTHON")
+    or _find_in_venv("venv/bin/python")
+    or "/usr/local/lib/whisper/bin/python"
+)
+WHISPER_SCRIPT = (
+    os.environ.get("WHISPER_SCRIPT")
+    or _find_in_venv("venv/bin/whisper")
+    or "/usr/local/lib/whisper/bin/whisper"
+)
 
 # MODEL_CACHE_DIR defaults to assets/models/whisper (project-relative, no root needed).
 # Can be overridden via XDG_CACHE_HOME env var for installations that share a model cache.
