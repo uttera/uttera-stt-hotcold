@@ -111,18 +111,26 @@ systemctl --user daemon-reload
 systemctl --user enable --now whisper-stt.service
 ```
 
-## 🔍 Debugging & Monitoring
+## 🔧 Troubleshooting
 
-### Enable Debug Mode
-Set `DEBUG=true` in your `.env` or prepend it to the start command:
-```bash
-DEBUG=true uvicorn main_stt:app --host 0.0.0.0 --port 5000
+### Cold Lane fails with `No such file or directory`
+If concurrent requests return HTTP 500 with a path error, the Cold Lane cannot find the Whisper CLI or Python binary. The server auto-detects `venv/bin/python` and `venv/bin/whisper` relative to the project directory. If running from a non-standard location, set the paths explicitly in `.env`:
+```env
+VENV_PYTHON=/absolute/path/to/venv/bin/python
+WHISPER_SCRIPT=/absolute/path/to/venv/bin/whisper
 ```
 
-### What does Debug Mode provide?
-- **Worker Routing:** Shows in real-time whether a request is handled by the **Hot Lane** (in-memory GPU) or the **Cold Lane** (on-demand subprocess).
-- **Command Visibility:** Prints the exact command passed to the Whisper CLI, including all parameters.
-- **Cleanup Traces:** Confirms deletion of temporary files after processing.
+### `PermissionError` on startup
+The server defaults to `assets/models/whisper` inside the project directory — no root required. If you see a permission error on a path like `/opt/...`, an old `XDG_CACHE_HOME` env var is being inherited from the shell. Either unset it or override it in `.env`:
+```env
+XDG_CACHE_HOME=assets/models
+```
+
+### Cold Lane subprocess times out
+If transcription of long audio hangs and eventually returns HTTP 500, increase the timeout in `.env`:
+```env
+COLD_LANE_TIMEOUT_SECONDS=600
+```
 
 ## 🔒 Security & Network Note
 By default, the server binds to **`127.0.0.1`** on port **`5000`**.
