@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.6] - 2026-04-03
+
+### Added
+- **`POST /v1/audio/translations` endpoint:** OpenAI-compatible translation endpoint. Accepts audio in any language and returns the transcription translated to English in a single Whisper pass (`task="translate"`). Accepts the same parameters as `/v1/audio/transcriptions` except `language` (output is always English). Fully routed through the Hot/Cold Lane architecture.
+
 ## [1.3.5] - 2026-04-03
 
 ### Fixed

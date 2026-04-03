@@ -14,11 +14,12 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.3.5
+# Version: 1.3.6
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.3.6 (2026-04-03): Added POST /v1/audio/translations endpoint (OpenAI spec). Transcribes audio in any language and returns English text. Uses Whisper task="translate" on both Hot and Cold lanes.
 # - 1.3.5 (2026-04-03): VENV_PYTHON and WHISPER_SCRIPT auto-detect local venv/bin/ relative to BASE_DIR before falling back to hardcoded sphinx paths.
 # - 1.3.4 (2026-04-03): MODEL_CACHE_DIR defaults to project-relative assets/models/whisper (no-sudo, no /opt). Mirrors coqui BASE_DIR pattern.
 # - 1.3.3 (2026-04-03): VENV_PYTHON and WHISPER_SCRIPT now read from env vars (VENV_PYTHON, WHISPER_SCRIPT) with hardcoded values as fallback.
@@ -53,7 +54,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.3.5"
+SERVER_VERSION = "1.3.6"
 
 # BASE_DIR is the directory containing this script. All local paths are relative to it,
 # allowing no-sudo installation as any user (mirrors coqui-tts-local-server pattern).
@@ -122,20 +123,20 @@ class TranscriptionResponse(BaseModel):
 # 3. Transcription Functions
 # -------------------------------
 
-def run_transcription_fast_lane(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float) -> dict:
-    log_debug("--- MAIN LANE: Using hot worker (GPU) ---")
+def run_transcription_fast_lane(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float, task: str = "transcribe") -> dict:
+    log_debug(f"--- MAIN LANE: Using hot worker (GPU), task={task} ---")
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False) as t:
             t.write(audio_bytes)
             temp_path = t.name
-        return whisper_model.transcribe(temp_path, language=language, initial_prompt=prompt, temperature=temp)
+        return whisper_model.transcribe(temp_path, language=language, initial_prompt=prompt, temperature=temp, task=task)
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
-async def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float) -> dict:
-    log_debug(f"--- CHILD LANE: Spawning new cold worker... ---")
+async def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float, task: str = "transcribe") -> dict:
+    log_debug(f"--- CHILD LANE: Spawning new cold worker, task={task}... ---")
     t_audio = None
     r_path = None
     try:
@@ -155,6 +156,7 @@ async def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str
         ]
         if language: cmd.extend(["--language", language])
         if prompt: cmd.extend(["--initial_prompt", prompt])
+        if task == "translate": cmd.extend(["--task", "translate"])
 
         # New in 1.2.3: Print the exact shell command if DEBUG=true
         log_debug(f"DEBUG EXEC: {' '.join(cmd)}")
@@ -253,6 +255,38 @@ async def create_transcription(
         # v1.3.1: Log full detail but return a generic message to avoid leaking internal paths.
         print(f"ERROR in create_transcription: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Transcription failed. Check server logs.")
+    finally:
+        await file.close()
+
+@app.post("/v1/audio/translations")
+async def create_translation(
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form("json"),
+    temperature: float = Form(0.0)
+):
+    """OpenAI-compatible translation endpoint. Transcribes audio in any language and
+    returns the result translated to English in a single Whisper pass (task='translate').
+    No 'language' parameter — output is always English.
+    """
+    if whisper_model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded.")
+    try:
+        contents = await file.read()
+        if model_lock.acquire(blocking=False):
+            log_debug("--- ROUTER: Fast lane is free. Sending translation request. ---")
+            try:
+                res = await asyncio.to_thread(run_transcription_fast_lane, contents, None, prompt, temperature, "translate")
+            finally:
+                model_lock.release()
+        else:
+            log_debug("--- ROUTER: Main lane is busy. Rerouting translation to child lane. ---")
+            res = await run_transcription_slow_lane(contents, None, prompt, temperature, "translate")
+
+        return res["text"] if response_format == "text" else res
+    except Exception as e:
+        print(f"ERROR in create_translation: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="Translation failed. Check server logs.")
     finally:
         await file.close()
 
