@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.4] - 2026-04-03
+
+### Fixed
+- **`PermissionError` on startup when installing as non-root:** `MODEL_CACHE_DIR` now defaults to `assets/models/whisper` inside the project directory (project-relative, no-sudo). The old default of `/opt/ai/models/speech` required root. Mirrors the `BASE_DIR`/`ASSETS_DIR` pattern from coqui-tts-local-server. Can still be overridden via `XDG_CACHE_HOME`.
+
 ## [1.3.3] - 2026-04-03
 
 ### Changed

@@ -14,11 +14,12 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.3.3
+# Version: 1.3.4
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.3.4 (2026-04-03): MODEL_CACHE_DIR defaults to project-relative assets/models/whisper (no-sudo, no /opt). Mirrors coqui BASE_DIR pattern.
 # - 1.3.3 (2026-04-03): VENV_PYTHON and WHISPER_SCRIPT now read from env vars (VENV_PYTHON, WHISPER_SCRIPT) with hardcoded values as fallback.
 # - 1.3.2 (2026-04-03): Cold Lane refactored to asyncio.create_subprocess_exec + asyncio.wait_for. Adds COLD_LANE_TIMEOUT_SECONDS env var (default 300s). Prevents hung subprocesses from blocking indefinitely.
 # - 1.3.1 (2026-04-03): Error sanitization: exceptions no longer leak internal paths or subprocess details in HTTP 500 responses. Full detail logged to stdout.
@@ -40,21 +41,35 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from pydantic import BaseModel
 from typing import Optional
 
-load_dotenv()
+# Load .env from the project directory or its parent
+_base = os.path.dirname(os.path.abspath(__file__))
+for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_base), ".env")]:
+    if os.path.exists(_env_path):
+        load_dotenv(_env_path)
+        break
 
 # -------------------------------
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.3.3"
+SERVER_VERSION = "1.3.4"
+
+# BASE_DIR is the directory containing this script. All local paths are relative to it,
+# allowing no-sudo installation as any user (mirrors coqui-tts-local-server pattern).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 
 # VENV_PYTHON and WHISPER_SCRIPT are configurable via env vars (set in .env).
 # The hardcoded values below are the fallback for the canonical sphinx installation.
 VENV_PYTHON = os.environ.get("VENV_PYTHON", "/usr/local/lib/whisper/bin/python")
 WHISPER_SCRIPT = os.environ.get("WHISPER_SCRIPT", "/usr/local/lib/whisper/bin/whisper")
 
-XDG_CACHE_HOME = os.environ.get("XDG_CACHE_HOME", "/opt/ai/models/speech")
-MODEL_CACHE_DIR = os.path.join(XDG_CACHE_HOME, "whisper")
+# MODEL_CACHE_DIR defaults to assets/models/whisper (project-relative, no root needed).
+# Can be overridden via XDG_CACHE_HOME env var for installations that share a model cache.
+MODEL_CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.join(ASSETS_DIR, "models")),
+    "whisper"
+)
 os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 
 COLD_LANE_TIMEOUT_SECONDS = int(os.environ.get("COLD_LANE_TIMEOUT_SECONDS", "300"))
