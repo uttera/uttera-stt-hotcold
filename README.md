@@ -137,7 +137,7 @@ By default, the server binds to **`127.0.0.1`** on port **`5000`**.
 - To allow external network access, change `--host` to `0.0.0.0`.
 - **WARNING**: This API **does not have authentication**. Exposing it to the network via `0.0.0.0` represents a security risk. Ensure the server is protected by a firewall or operating within a secure VPN/local network.
 
-## 📊 Performance Benchmarks (Sphinx GPU)
+## 📊 Performance Benchmarks (NVIDIA RTX 5090)
 
 | Task | Hot Lane | Cold Lane |
 | :--- | :--- | :--- |
