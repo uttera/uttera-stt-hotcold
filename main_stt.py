@@ -14,11 +14,15 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.2.3
+# Version: 1.3.3
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.3.3 (2026-04-03): VENV_PYTHON and WHISPER_SCRIPT now read from env vars (VENV_PYTHON, WHISPER_SCRIPT) with hardcoded values as fallback.
+# - 1.3.2 (2026-04-03): Cold Lane refactored to asyncio.create_subprocess_exec + asyncio.wait_for. Adds COLD_LANE_TIMEOUT_SECONDS env var (default 300s). Prevents hung subprocesses from blocking indefinitely.
+# - 1.3.1 (2026-04-03): Error sanitization: exceptions no longer leak internal paths or subprocess details in HTTP 500 responses. Full detail logged to stdout.
+# - 1.3.0 (2026-04-03): Added GET /health and GET /v1/models endpoints. SERVER_VERSION constant introduced. hot_worker_error global tracks model load failures and is exposed in /health.
 # - 1.2.3 (2026-02-27): Strict DEBUG control and shell command printing in slow lane.
 # - 1.2.2 (2026-02-27): Wrapped model loading prints into DEBUG toggle.
 
@@ -31,18 +35,29 @@ import asyncio
 import threading
 import subprocess
 import json
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from pydantic import BaseModel
 from typing import Optional
 
+load_dotenv()
+
 # -------------------------------
 # 1. Global Config & Logging
 # -------------------------------
-VENV_PYTHON = "/usr/local/lib/whisper/bin/python"
-WHISPER_SCRIPT = "/usr/local/lib/whisper/bin/whisper"
+
+SERVER_VERSION = "1.3.3"
+
+# VENV_PYTHON and WHISPER_SCRIPT are configurable via env vars (set in .env).
+# The hardcoded values below are the fallback for the canonical sphinx installation.
+VENV_PYTHON = os.environ.get("VENV_PYTHON", "/usr/local/lib/whisper/bin/python")
+WHISPER_SCRIPT = os.environ.get("WHISPER_SCRIPT", "/usr/local/lib/whisper/bin/whisper")
+
 XDG_CACHE_HOME = os.environ.get("XDG_CACHE_HOME", "/opt/ai/models/speech")
 MODEL_CACHE_DIR = os.path.join(XDG_CACHE_HOME, "whisper")
 os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+
+COLD_LANE_TIMEOUT_SECONDS = int(os.environ.get("COLD_LANE_TIMEOUT_SECONDS", "300"))
 
 # Strict DEBUG toggle: Only "true" enables extra logging
 DEBUG_MODE = os.environ.get("DEBUG", "").lower() == "true"
@@ -52,12 +67,14 @@ def log_debug(message: str):
         print(message)
 
 model_lock = threading.Lock()
-app = FastAPI(title="Whisper STT Server", version="1.2.3")
+app = FastAPI(title="Whisper STT Server", version=SERVER_VERSION)
 
 # -------------------------------
 # 2. Model Loading
 # -------------------------------
 model_name = os.environ.get("WHISPER_MODEL", "medium")
+hot_worker_error: Optional[str] = None
+
 log_debug(f"Loading HOT WORKER model '{model_name}' into memory...")
 try:
     whisper_model = whisper.load_model(model_name, download_root=MODEL_CACHE_DIR)
@@ -66,6 +83,7 @@ except Exception as e:
     # Critical errors are always printed to stderr
     print(f"CRITICAL ERROR: Could not load model: {e}")
     whisper_model = None
+    hot_worker_error = str(e)
 
 class TranscriptionResponse(BaseModel):
     text: str
@@ -86,7 +104,7 @@ def run_transcription_fast_lane(audio_bytes: bytes, language: Optional[str], pro
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
-def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float) -> dict:
+async def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float) -> dict:
     log_debug(f"--- CHILD LANE: Spawning new cold worker... ---")
     t_audio = None
     r_path = None
@@ -94,28 +112,51 @@ def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str], pro
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=MODEL_CACHE_DIR) as t:
             t.write(audio_bytes)
             t_audio = t.name
-        
+
         sub_env = os.environ.copy()
         sub_env["WHISPER_CACHE_DIR"] = MODEL_CACHE_DIR
-        
+
         cmd = [
-            VENV_PYTHON, WHISPER_SCRIPT, t_audio, 
-            "--model", model_name, 
-            "--output_format", "json", 
-            "--output_dir", MODEL_CACHE_DIR, 
+            VENV_PYTHON, WHISPER_SCRIPT, t_audio,
+            "--model", model_name,
+            "--output_format", "json",
+            "--output_dir", MODEL_CACHE_DIR,
             "--temperature", str(temp)
         ]
         if language: cmd.extend(["--language", language])
         if prompt: cmd.extend(["--initial_prompt", prompt])
-        
+
         # New in 1.2.3: Print the exact shell command if DEBUG=true
         log_debug(f"DEBUG EXEC: {' '.join(cmd)}")
 
-        subprocess.run(cmd, check=True, capture_output=True, text=True, env=sub_env)
-        
+        # v1.3.2: asyncio.create_subprocess_exec + wait_for timeout replaces blocking subprocess.run().
+        # This prevents a hung subprocess (OOM, driver crash) from blocking the server indefinitely.
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=sub_env
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=COLD_LANE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            raise RuntimeError(f"Cold Lane subprocess timed out after {COLD_LANE_TIMEOUT_SECONDS}s")
+
+        if process.returncode != 0:
+            # v1.3.1: Full detail is logged but NOT sent to the client to avoid path/info leakage.
+            print(f"COLD LANE ERROR (exit {process.returncode}): {stderr.decode()}", flush=True)
+            raise RuntimeError(f"Cold Lane transcription failed (subprocess exited {process.returncode})")
+
+        if DEBUG_MODE:
+            print(f"COLD LANE STDOUT: {stdout.decode()}", flush=True)
+
         f_base, _ = os.path.splitext(os.path.basename(t_audio))
         r_path = os.path.join(MODEL_CACHE_DIR, f_base + ".json")
-        
+
         with open(r_path, 'r') as f:
             data = json.load(f)
         return data
@@ -123,6 +164,37 @@ def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str], pro
         if t_audio and os.path.exists(t_audio): os.remove(t_audio)
         if r_path and os.path.exists(r_path): os.remove(r_path)
         log_debug(f"--- CHILD LANE: Cleanup complete. ---")
+
+# -------------------------------
+# 4. Endpoints
+# -------------------------------
+
+@app.get("/v1/models")
+async def list_models():
+    """OpenAI-compatible model listing. Returns the standard STT model IDs.
+    The 'model' field in transcription requests is accepted for spec compliance
+    but ignored internally — all requests are handled by the configured Whisper model.
+    """
+    return {
+        "object": "list",
+        "data": [
+            {"id": "whisper-1", "object": "model", "created": 1677610602, "owned_by": "uttera-legacy"},
+        ]
+    }
+
+@app.get("/health")
+async def health_check():
+    """Returns server liveness and hot worker status. Suitable for proxies and Docker healthchecks.
+    'hot_worker_loaded': false and 'hot_worker_error' set means server is running in degraded mode
+    (all requests will fail — cold lane requires the venv python and whisper CLI).
+    """
+    return {
+        "status": "ok",
+        "version": SERVER_VERSION,
+        "model": model_name,
+        "hot_worker_loaded": whisper_model is not None,
+        "hot_worker_error": hot_worker_error
+    }
 
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
@@ -144,13 +216,15 @@ async def create_transcription(
                 model_lock.release()
         else:
             log_debug("--- ROUTER: Main lane is busy. Rerouting to child lane. ---")
-            res = await asyncio.to_thread(run_transcription_slow_lane, contents, language, prompt, temperature)
-        
+            res = await run_transcription_slow_lane(contents, language, prompt, temperature)
+
         return res["text"] if response_format == "text" else res
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # v1.3.1: Log full detail but return a generic message to avoid leaking internal paths.
+        print(f"ERROR in create_transcription: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="Transcription failed. Check server logs.")
     finally:
         await file.close()
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, log_level="info")
+    uvicorn.run("main_stt:app", host="0.0.0.0", port=5000, log_level="info")
