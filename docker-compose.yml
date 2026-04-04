@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  whisper-stt:
+    build: .
+    container_name: whisper-stt-server
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./assets/models:/app/assets/models
+      - ./assets/cache:/app/assets/cache
+    environment:
+      - WHISPER_MODEL=medium
+      - DEBUG=false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
