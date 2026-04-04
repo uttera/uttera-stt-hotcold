@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.8] - 2026-04-04
+
+### Added
+- **Docker Support:** Official support for containerized deployment with NVIDIA GPU acceleration.
+- **NVIDIA CDI Integration:** Optimized for modern Docker environments (Ubuntu 22.04+) using Container Device Interface for robust GPU passthrough.
+- **Documentation:** Added detailed Docker setup instructions and host prerequisites to README.md.
+
 ## [1.3.7] - 2026-04-04
 
 ### Added
