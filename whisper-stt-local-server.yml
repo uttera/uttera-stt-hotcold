@@ -1,0 +1,11 @@
+name: "Whisper STT Local Server"
+website_url: "https://github.com/fakehec/whisper-stt-local-server"
+source_code_url: "https://github.com/fakehec/whisper-stt-local-server"
+description: "High-performance Whisper STT API server with a hybrid Hot/Cold worker architecture for ultra-low latency inference."
+licenses:
+  - GPL-3.0
+platforms:
+  - Python
+  - Docker
+tags:
+  - Generative Artificial Intelligence (GenAI)
