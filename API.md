@@ -68,7 +68,12 @@ Returns server liveness and hot worker status. Suitable for monitoring and healt
 
 ### `GET /v1/models`
 
-OpenAI-compatible model listing.
+OpenAI-compatible model listing. Returns the currently loaded Whisper model.
+
+**Example Request:**
+```bash
+curl -X GET "http://localhost:5000/v1/models"
+```
 
 **Example Response:**
 ```json
