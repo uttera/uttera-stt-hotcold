@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.7] - 2026-04-07
+
+### Fixed
+- **`SyntaxError`: `global _cold_workers_in_flight` used before declaration:** In both `create_transcription` and `create_translation`, a debug `print` f-string inside Branch C read `_cold_workers_in_flight` before the `global` declaration that followed it, causing Python to raise `SyntaxError: name '_cold_workers_in_flight' is used prior to global declaration` on startup. Fixed by moving the `global _cold_workers_in_flight` statement to the very top of the `else:` block, before any read of the variable.
+- **Cold lane silent failure on empty/inaudible audio:** When whisper exited with code 0 but produced no output JSON (audio with no detectable speech segments), the server raised an opaque `[Errno 2] No such file or directory`. Added an explicit check: if the output JSON path does not exist after a clean exit, full `stdout` and `stderr` are logged and a descriptive `RuntimeError("Cold Lane produced no output (exit 0, JSON missing)")` is raised instead.
+
+### Validated
+- 40-clip Spanish stress test (40/40 OK, sim avg=0.989, WAcc avg=0.986, zero HTTP errors). Four waves: 10 concurrent, 10 staggered @0.2s, 10 concurrent, 10 staggered @0.1s. Cold EMA calibrated at 14-15s, max 3 concurrent cold workers with `MIN_COLD_VRAM_GB=4.0` on 13.5 GB free VRAM. Results fully reproducible across two runs with warm EMA.
+
+## [1.4.6] - 2026-04-06
+
+### Added
+- **VRAM pre-check before cold lane dispatch:** Branch C now calls `torch.cuda.mem_get_info()` before spawning a cold subprocess. If effective free VRAM (raw free minus `in_flight × MIN_COLD_VRAM_GB` reserved for already-dispatched workers) is below `MIN_COLD_VRAM_GB` (default `4.0` GB, configurable via `.env`), the request is rerouted to the hot lane queue immediately — avoiding the 8-10s wasted loading the model before OOM. The in-flight reservation prevents burst routing decisions from collectively over-committing memory before any subprocess has actually allocated. Free VRAM, `min_cold_vram_gb`, `cold_workers_in_flight`, and `vram_sufficient_for_cold` added to `GET /health` under `smart_routing`. Set `MIN_COLD_VRAM_GB=0` to disable. Applied to both `/v1/audio/transcriptions` and `/v1/audio/translations`.
+
+## [1.4.5] - 2026-04-06
+
+### Fixed
+- **`model_lock` deadlock under client timeout:** Branch B and the Branch C fallback previously used two separate `asyncio.to_thread` calls — one to acquire `model_lock` and one to run transcription. If asyncio cancelled the coroutine (e.g. client timeout during burst load) between the two awaits, `model_lock` was left permanently acquired with no one to release it, deadlocking the server for all subsequent requests. Fixed by introducing `_run_hot_locked()`, which performs acquire + transcribe + release inside a single `asyncio.to_thread` call. Because the entire lock lifecycle is confined to one thread, cancellation of the calling coroutine cannot interrupt it. Applied to both `/v1/audio/transcriptions` and `/v1/audio/translations`. Confirmed by burst-of-40 test: previous version deadlocked after client timeouts; this version drains the queue correctly even after clients disconnect.
+
+## [1.4.4] - 2026-04-06
+
+### Added
+- **Auto-Calibration of `COLD_START_TIME_SECONDS`:** The router now measures each successful cold lane completion and maintains an EMA (α = 0.2) of cold lane times in `_cold_ema_start_stt`. Once seeded, `_get_cold_start_time_stt()` returns the live EMA instead of the static `COLD_START_TIME_SECONDS`. `COLD_START_TIME_SECONDS` in `.env` becomes an initial hint / fallback used only before the first successful cold lane completes. `cold_start_calibrated`, `cold_ema_start_seconds`, and `cold_start_configured_seconds` added to `GET /health` under `smart_routing`. Applied to both `/v1/audio/transcriptions` and `/v1/audio/translations`.
+
+## [1.4.3] - 2026-04-06
+
+### Fixed
+- **EMA not updated from fallback path:** The cold-lane fallback was calling `_update_hot_ema_stt` with an elapsed time that included the cold-lane failure duration (~`COLD_START_TIME_SECONDS`), inflating `ema_sps` and creating a positive feedback loop. The EMA is now updated only from clean Branch A and Branch B completions. Applied to both `/v1/audio/transcriptions` and `/v1/audio/translations` fallback paths.
+
+## [1.4.2] - 2026-04-06
+
+### Added
+- **Startup EMA Warmup:** After the hot worker loads, a 2-second synthetic silence clip is transcribed automatically to seed `_hot_ema_sps` before the first real request arrives. Without this, `EMA=None` at startup caused every concurrent request to go to cold lane (Branch C), triggering CUDA OOM when multiple workers tried to load the model simultaneously. The warmup runs as a FastAPI `startup` event (async, non-blocking) and prints the measured `sps` on the console so the operator can verify hardware throughput at startup. Failure is logged but non-fatal: the server starts in uncalibrated mode rather than refusing to start.
+
+## [1.4.1] - 2026-04-06
+
+### Added
+- **Cold-Lane Fallback to Hot Lane:** When a cold lane subprocess exits with a non-zero code (the primary cause being CUDA OOM when multiple cold workers attempt to load the model simultaneously), the request is transparently retried on the hot lane instead of returning HTTP 500. The fallback uses the same Branch-B queuing mechanism — `audio_dur` is added to `_hot_queue_audio_seconds` before waiting so late-arriving requests see the correct queue depth. By the time cold lane fails (~`COLD_START_TIME_SECONDS` in), the hot lane has typically drained significantly and the additional wait is short. Applied to both `/v1/audio/transcriptions` and `/v1/audio/translations`.
+
+## [1.4.0] - 2026-04-06
+
+### Added
+- **Smart Hot-Lane Routing:** Three-branch router replaces the previous binary hot/cold decision, mirroring the architecture introduced in coqui-tts-local-server v1.5.0.
+  - **Branch A** (hot lane free): use immediately — unchanged from prior behaviour.
+  - **Branch B** (hot lane busy, worth waiting): if the estimated queue drain time is below `COLD_START_TIME_SECONDS × HOT_QUEUE_SAFETY_FACTOR`, the request waits for the hot lane via a non-blocking `asyncio.to_thread(model_lock.acquire)` instead of spawning a cold subprocess.
+  - **Branch C** (hot lane busy, cold is faster): drain estimate exceeds threshold → spawn cold lane as before.
+  - Unlike the TTS server (which uses word count), the STT drain estimate uses **audio duration in seconds** as the queue unit — the natural proxy for Whisper processing time. Duration is read from the WAV header via stdlib `wave`; non-WAV formats (MP3, M4A, etc.) fall back to a byte-size heuristic.
+  - EMA (α = 0.2) tracks server-seconds per audio-second (`ema_sps`) and self-calibrates after each successful hot-lane transcription. Falls back to Branch C when not yet calibrated.
+  - Applied to both `/v1/audio/transcriptions` and `/v1/audio/translations`.
+  - New env vars: `COLD_START_TIME_SECONDS` (default `8.0` s), `HOT_QUEUE_SAFETY_FACTOR` (default `0.8`).
+  - Routing stats and live telemetry (`ema_sps`, `hot_queue_audio_seconds`, `hot_queue_drain_estimate_seconds`, `threshold_seconds`) exposed in `GET /health` under `smart_routing`.
+
 ## [1.3.8] - 2026-04-04
 
 ### Added
