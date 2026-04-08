@@ -444,13 +444,6 @@ def _optimal_cold_workers() -> int:
     N_total -= 1  # step back to largest satisfying value
     cold = N_total - 1  # subtract the hot worker
 
-    # Cap by VRAM
-    free_gb = _free_vram_gb()
-    if free_gb is not None:
-        vram_per = _vram_per_cold_worker()
-        if vram_per > 0:
-            cold = min(cold, int(free_gb / vram_per))
-
     # Cap by operator safety limit
     if COLD_POOL_SIZE > 0:
         cold = min(cold, COLD_POOL_SIZE)
