@@ -19,6 +19,18 @@
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.6.2 (2026-04-08): Fix VRAM cap in _optimal_cold_workers. The old cap
+#   used int(free_gb/vram_per) as an absolute total, ignoring VRAM already
+#   consumed by running workers — with N active workers it returned N as optimal
+#   and the manager never spawned more. Removed: VRAM gating is handled solely
+#   by _has_vram_for_cold_lane() in the pool manager (correct single source).
+#   Result: 400-request burst now spawns 8 workers (0.64 GB free) vs 4 (9.62 GB
+#   wasted). Note: GPU serializes inference across workers so throughput is bounded
+#   by GPU compute regardless of worker count; benefit is latency distribution.
+# - 1.6.1 (2026-04-08): Cold pool worker crash fallback to hot lane. On any pool
+#   worker failure (OOM, kill, crash), the WorkItem is re-queued so the hot worker
+#   rescues it instead of returning HTTP 500. X-Route reports "COLD-POOL>HOT".
+#   Validated with COLD_CRASH_TEST=1: 40/40 OK, 18 requests via fallback path.
 # - 1.6.0 (2026-04-08): Shared work queue + dynamic pool sizing. All requests
 #   (hot and cold) are dispatched through a single asyncio.Queue. The hot worker
 #   and all pool workers consume from this queue, so cold workers spawned mid-burst
@@ -105,7 +117,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.6.0"
+SERVER_VERSION = "1.6.2"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
