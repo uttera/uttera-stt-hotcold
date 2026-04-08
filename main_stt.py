@@ -14,11 +14,18 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.5.0
+# Version: 1.5.1
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.5.1 (2026-04-08): Cold EMA startup warmup + unified inference EMA. At startup, a cold
+#   worker is spawned, a silence clip is transcribed through it to measure total cold start
+#   time (load + inference), cold_ema is seeded, VRAM drop measured, then the worker is killed.
+#   This eliminates the uncalibrated period where cold_ema=COLD_START_TIME_SECONDS (8s) caused
+#   premature cold dispatches before any real cold lane request completed. _cold_inference_ema_stt
+#   removed: once a cold worker is loaded, inference time equals hot lane inference time (same
+#   model, same GPU), so _hot_ema_sps is the correct estimator for pool worker throughput.
 # - 1.5.0 (2026-04-08): Cold worker pool. Persistent subprocesses (cold_worker.py) load the
 #   Whisper model once and serve multiple requests via newline-delimited JSON on stdin/stdout,
 #   eliminating the ~18-20 s model-load cost on every cold lane request. New routing branch
@@ -157,7 +164,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.5.1"
 
 # BASE_DIR is the directory containing this script. All local paths are relative to it,
 # allowing no-sudo installation as any user (mirrors coqui-tts-local-server pattern).
@@ -245,6 +252,7 @@ async def _lifespan(application: FastAPI):
     global _cold_idle_pool
     _cold_idle_pool = asyncio.Queue()
     await _warmup_ema()
+    await _warmup_cold_ema()
     yield
     # Shutdown: gracefully drain the idle pool
     while not _cold_idle_pool.empty():
@@ -318,11 +326,6 @@ _COLD_VRAM_EMA_ALPHA = 0.3
 _COLD_VRAM_SAFETY_FACTOR = 1.2  # 20% headroom above measured EMA
 
 # EMA of inference-only time for pool workers (model already loaded, no spawn overhead).
-# Used in health telemetry; routing always prefers an idle pool worker over queuing hot
-# when the hot lane is busy.
-_cold_inference_ema_stt: Optional[float] = None
-_COLD_INFERENCE_EMA_ALPHA = 0.2
-
 # asyncio.Queue of idle _ColdWorker instances. Initialised in _lifespan (requires event loop).
 _cold_idle_pool: Optional[asyncio.Queue] = None
 
@@ -337,14 +340,6 @@ def _update_cold_vram_ema(vram_gb: float) -> None:
     else:
         _cold_vram_ema_gb = _COLD_VRAM_EMA_ALPHA * vram_gb + (1.0 - _COLD_VRAM_EMA_ALPHA) * _cold_vram_ema_gb
 
-
-def _update_cold_inference_ema_stt(elapsed: float) -> None:
-    """Update the inference-only EMA for pool workers."""
-    global _cold_inference_ema_stt
-    if _cold_inference_ema_stt is None:
-        _cold_inference_ema_stt = elapsed
-    else:
-        _cold_inference_ema_stt = _COLD_INFERENCE_EMA_ALPHA * elapsed + (1.0 - _COLD_INFERENCE_EMA_ALPHA) * _cold_inference_ema_stt
 
 
 def _vram_per_cold_worker() -> float:
@@ -657,7 +652,7 @@ async def _warmup_ema():
     if whisper_model is None:
         return  # degraded mode — nothing to warm up
 
-    print("WARMUP: Seeding EMA with synthetic silence clip...", flush=True)
+    print("WARMUP HOT: Seeding EMA with synthetic silence clip...", flush=True)
     try:
         silence = _make_silence_wav(duration_seconds=2.0)
         audio_dur = _get_audio_duration(silence)
@@ -665,9 +660,57 @@ async def _warmup_ema():
         await asyncio.to_thread(run_transcription_fast_lane, silence, None, None, 0.0)
         elapsed = time.monotonic() - t0
         _update_hot_ema_stt(elapsed, audio_dur)
-        print(f"WARMUP: EMA seeded. sps={_hot_ema_sps:.4f} (elapsed={elapsed:.2f}s for {audio_dur:.1f}s audio)", flush=True)
+        print(f"WARMUP HOT: sps={_hot_ema_sps:.4f} (elapsed={elapsed:.2f}s for {audio_dur:.1f}s audio)", flush=True)
     except Exception as e:
-        print(f"WARMUP: Failed to seed EMA ({e}). Server starting in uncalibrated mode.", flush=True)
+        print(f"WARMUP HOT: Failed ({e}). Starting in uncalibrated mode.", flush=True)
+
+
+async def _warmup_cold_ema():
+    """
+    Spawn one cold worker at startup, transcribe a silence clip through it, record the
+    total elapsed time as the initial cold_ema_start_stt, measure VRAM drop, then kill
+    the worker. This calibrates the routing threshold before any real request arrives,
+    preventing the uncalibrated period where cold_ema=COLD_START_TIME_SECONDS (8 s default)
+    causes premature cold dispatches. Non-fatal: server starts uncalibrated if this fails.
+    """
+    if COLD_POOL_SIZE <= 0:
+        return
+
+    print("WARMUP COLD: Spawning cold worker to calibrate cold_ema...", flush=True)
+    global _cold_workers_in_flight
+    v_before = _free_vram_gb() or 0.0
+    _cold_workers_in_flight += 1
+    worker = _ColdWorker()
+    t_start = time.monotonic()
+    try:
+        spawned = await worker.spawn()
+        if not spawned:
+            print("WARMUP COLD: Worker failed to start. cold_ema uncalibrated.", flush=True)
+            return
+        # VRAM measurement (model is now loaded)
+        v_after = _free_vram_gb() or 0.0
+        drop = v_before - v_after
+        if drop > 0:
+            _update_cold_vram_ema(drop)
+        _cold_workers_in_flight -= 1
+        # Transcribe silence to include inference cost in the EMA
+        silence = _make_silence_wav(duration_seconds=2.0)
+        await worker.transcribe(silence, None, None, 0.0, "transcribe")
+        total_elapsed = time.monotonic() - t_start
+        _update_cold_ema_stt(total_elapsed)
+        load_elapsed = total_elapsed - (time.monotonic() - t_start)  # approx load portion
+        print(
+            f"WARMUP COLD: cold_ema={total_elapsed:.1f}s | "
+            f"vram_drop={drop:.2f}GB (EMA={_cold_vram_ema_gb:.2f}GB) | "
+            f"threshold={_get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR:.1f}s",
+            flush=True
+        )
+    except Exception as e:
+        print(f"WARMUP COLD: Failed ({e}). cold_ema uncalibrated.", flush=True)
+        if _cold_workers_in_flight > 0:
+            _cold_workers_in_flight -= 1
+    finally:
+        await worker.shutdown()
 
 
 # -------------------------------
@@ -711,7 +754,6 @@ async def health_check():
         "cold_workers_in_flight": _cold_workers_in_flight,
         "cold_pool_idle": _cold_idle_pool.qsize() if _cold_idle_pool is not None else 0,
         "cold_pool_size": COLD_POOL_SIZE,
-        "cold_inference_ema_seconds": round(_cold_inference_ema_stt, 2) if _cold_inference_ema_stt is not None else None,
         "vram_sufficient_for_cold": _has_vram_for_cold_lane(),
     }
     return {
@@ -761,7 +803,6 @@ async def create_transcription(
                 t_infer = time.monotonic()
                 try:
                     res = await idle_worker.transcribe(contents, language, prompt, temperature, "transcribe")
-                    _update_cold_inference_ema_stt(time.monotonic() - t_infer)
                     await _return_to_pool(idle_worker)
                 except Exception as pool_err:
                     route = "COLD-POOL→HOT"
@@ -802,9 +843,7 @@ async def create_transcription(
                     t_infer = time.monotonic()
                     try:
                         res = await worker.transcribe(contents, language, prompt, temperature, "transcribe")
-                        inference_elapsed = time.monotonic() - t_infer
                         _update_cold_ema_stt(time.monotonic() - t_start)
-                        _update_cold_inference_ema_stt(inference_elapsed)
                         await _return_to_pool(worker)
                     except Exception as infer_err:
                         await worker.shutdown()
@@ -897,7 +936,6 @@ async def create_translation(
                 t_infer = time.monotonic()
                 try:
                     res = await idle_worker.transcribe(contents, None, prompt, temperature, "translate")
-                    _update_cold_inference_ema_stt(time.monotonic() - t_infer)
                     await _return_to_pool(idle_worker)
                 except Exception as pool_err:
                     route = "COLD-POOL→HOT"
@@ -938,9 +976,7 @@ async def create_translation(
                     t_infer = time.monotonic()
                     try:
                         res = await worker.transcribe(contents, None, prompt, temperature, "translate")
-                        inference_elapsed = time.monotonic() - t_infer
                         _update_cold_ema_stt(time.monotonic() - t_start)
-                        _update_cold_inference_ema_stt(inference_elapsed)
                         await _return_to_pool(worker)
                     except Exception as infer_err:
                         await worker.shutdown()
