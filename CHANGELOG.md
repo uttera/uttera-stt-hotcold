@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-04-08
+
+### Added
+- **Cold worker pool (`cold_worker.py`):** Persistent Whisper subprocesses that load the model once and serve multiple requests via newline-delimited JSON on `stdin`/`stdout`, eliminating the ~18-20 s model-load cost paid on every cold lane request in prior versions. Workers self-manage their lifecycle: after `COLD_WORKER_IDLE_TIMEOUT` seconds (default 60 s) of inactivity, they write `{"exit": "idle_timeout"}` and exit cleanly. Up to `COLD_POOL_SIZE` workers (default 2) are kept alive in an idle pool across requests.
+- **Branch 0 routing (`COLD-POOL`):** When the hot lane is busy and an idle pool worker is available, the request is dispatched directly to that worker (inference only, ~5-7 s) instead of queuing for hot or spawning a new cold worker that would pay the full ~20 s load cost. This resolves the root cause of the routing performance regression identified in v1.4.12: cold workers now compete fairly with the hot lane because their effective latency matches inference time, not load+inference time.
+- **`_cold_inference_ema_stt`:** New EMA tracking inference-only time for pool workers. Exposed in `GET /health` as `cold_inference_ema_seconds`. Separate from `cold_ema_start_seconds` (which continues to measure full load+inference for newly spawned workers).
+- **VRAM measurement at spawn time:** VRAM drop is now measured directly after `_ColdWorker.spawn()` returns (model fully loaded, `{"ready": true}` received) instead of via a deferred `asyncio.sleep(12)` sampler. Measurement is skipped if multiple workers are spawning concurrently (ambiguous attribution).
+- **`GET /health` additions:** `cold_pool_idle` (current idle workers), `cold_pool_size` (configured max), `cold_inference_ema_seconds`.
+- **X-Route header on translation responses:** `POST /v1/audio/translations` now also returns the `X-Route` response header (`HOT-A`, `HOT-B`, `HOT-C`, `COLD-POOL`, `COLD`, `COLD→HOT`, `COLD-POOL→HOT`), matching the behaviour introduced for transcription in v1.4.11.
+- **New env vars:** `COLD_POOL_SIZE` (default `2`), `COLD_WORKER_IDLE_TIMEOUT` (default `60` s).
+
 ## [1.4.10] - 2026-04-08
 
 ### Fixed

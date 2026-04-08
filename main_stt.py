@@ -14,11 +14,35 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.4.10
+# Version: 1.5.0
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.5.0 (2026-04-08): Cold worker pool. Persistent subprocesses (cold_worker.py) load the
+#   Whisper model once and serve multiple requests via newline-delimited JSON on stdin/stdout,
+#   eliminating the ~18-20 s model-load cost on every cold lane request. New routing branch
+#   (Branch 0 / COLD-POOL) fires when an idle pool worker is available and the hot lane is
+#   busy — inference-only cost (~5-7 s) vs. waiting for hot or spawning a new cold worker.
+#   After any new cold spawn completes, the worker is returned to the pool (up to COLD_POOL_SIZE
+#   idle slots; excess workers shut down gracefully). VRAM is now measured directly right after
+#   the worker signals ready (model loaded) instead of with a delayed asyncio.sleep sampler.
+#   New globals: _cold_inference_ema_stt (inference-only EMA for pool routing), _cold_idle_pool
+#   (asyncio.Queue of idle _ColdWorker instances). New env vars: COLD_POOL_SIZE (default 2),
+#   COLD_WORKER_IDLE_TIMEOUT (default 60 s). X-Route header now also on translation responses.
+#   New route labels: COLD-POOL (pool inference), COLD-POOL→HOT (pool failed, fell back).
+# - 1.4.12 (2026-04-08): Auto-calibration of MIN_COLD_VRAM_GB. Samples VRAM 12s after each
+#   cold dispatch (model loaded by then) and maintains EMA (_cold_vram_ema_gb × 1.2 safety
+#   margin) to replace the static MIN_COLD_VRAM_GB in _has_vram_for_cold_lane(). Fixes the
+#   fp16 regression where MIN_COLD_VRAM_GB=4.0 (set for fp32) blocked cold dispatches that
+#   would have fit in ~1.4 GB. Exposed as cold_vram_ema_gb and cold_vram_per_worker_gb in
+#   GET /health. Falls back to MIN_COLD_VRAM_GB before first cold run completes.
+# - 1.4.11 (2026-04-08): Fix EMA inflation from queue wait time. _run_hot_locked now returns
+#   (result, proc_elapsed) where proc_elapsed is measured from after lock acquisition, excluding
+#   queue wait time. Branch B was previously measuring total time-in-system (wait + process),
+#   inflating ema_sps and causing the router to underestimate hot lane throughput, which
+#   incorrectly sent requests to cold lane even when hot lane queue drain was well below the
+#   cold start threshold.
 # - 1.4.10 (2026-04-08): Fallback hot lane retry on transient CUDA errors. When cold lane fails
 #   and the hot lane fallback hits a cuDNN/CUBLAS/OOM error (caused by VRAM pressure from dying
 #   cold workers not yet released by the driver), retries up to 3 times with exponential backoff
@@ -104,6 +128,7 @@
 import io
 import wave
 import time
+import base64
 import torch
 import uvicorn
 import whisper
@@ -116,6 +141,7 @@ import subprocess
 import json
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -131,7 +157,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.4.10"
+SERVER_VERSION = "1.5.0"
 
 # BASE_DIR is the directory containing this script. All local paths are relative to it,
 # allowing no-sudo installation as any user (mirrors coqui-tts-local-server pattern).
@@ -156,6 +182,16 @@ WHISPER_SCRIPT = (
     or _find_in_venv("venv/bin/whisper")
     or "/usr/local/lib/whisper/bin/whisper"
 )
+
+# Path to the persistent cold worker subprocess script.
+COLD_WORKER_SCRIPT = os.path.join(BASE_DIR, "cold_worker.py")
+
+# Maximum number of idle (loaded) cold workers kept alive in the pool.
+# Each idle worker holds ~1.5 GB VRAM (fp16). Set to 0 to disable the pool (spawn-and-die behaviour).
+COLD_POOL_SIZE = int(os.environ.get("COLD_POOL_SIZE", "2"))
+
+# Seconds of inactivity before an idle pool worker exits on its own.
+COLD_WORKER_IDLE_TIMEOUT = int(os.environ.get("COLD_WORKER_IDLE_TIMEOUT", "60"))
 
 # MODEL_CACHE_DIR defaults to assets/models/whisper (project-relative, no root needed).
 # Can be overridden via XDG_CACHE_HOME env var for installations that share a model cache.
@@ -206,8 +242,17 @@ model_lock = threading.Lock()
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
+    global _cold_idle_pool
+    _cold_idle_pool = asyncio.Queue()
     await _warmup_ema()
     yield
+    # Shutdown: gracefully drain the idle pool
+    while not _cold_idle_pool.empty():
+        try:
+            w = _cold_idle_pool.get_nowait()
+            await w.shutdown()
+        except asyncio.QueueEmpty:
+            break
 
 
 app = FastAPI(title="Whisper STT Server", version=SERVER_VERSION, lifespan=_lifespan)
@@ -259,11 +304,175 @@ _hot_queue_audio_seconds: float = 0.0
 _cold_ema_start_stt: Optional[float] = None
 _COLD_EMA_ALPHA_STT = 0.2
 
-# Count of cold lane subprocesses currently in flight (loading model + transcribing).
-# Used by _has_vram_for_cold_lane() to reserve MIN_COLD_VRAM_GB per in-flight worker so that
-# simultaneous Branch C routing decisions don't all see the same un-allocated free VRAM and
-# collectively over-commit memory before any worker has started allocating.
+# Count of cold workers currently in the model-loading phase (spawned but not yet ready).
+# Used by _has_vram_for_cold_lane() to reserve VRAM for workers whose memory hasn't
+# appeared yet in torch.cuda.mem_get_info(). Decremented when the worker signals ready.
 _cold_workers_in_flight: int = 0
+
+# EMA of measured VRAM consumed per cold worker (GB). None = not yet measured.
+# Measured right after each new worker signals ready (model fully loaded on GPU).
+# Replaces the static MIN_COLD_VRAM_GB in _has_vram_for_cold_lane() once seeded.
+# MIN_COLD_VRAM_GB becomes the fallback used only before the first cold run completes.
+_cold_vram_ema_gb: Optional[float] = None
+_COLD_VRAM_EMA_ALPHA = 0.3
+_COLD_VRAM_SAFETY_FACTOR = 1.2  # 20% headroom above measured EMA
+
+# EMA of inference-only time for pool workers (model already loaded, no spawn overhead).
+# Used in health telemetry; routing always prefers an idle pool worker over queuing hot
+# when the hot lane is busy.
+_cold_inference_ema_stt: Optional[float] = None
+_COLD_INFERENCE_EMA_ALPHA = 0.2
+
+# asyncio.Queue of idle _ColdWorker instances. Initialised in _lifespan (requires event loop).
+_cold_idle_pool: Optional[asyncio.Queue] = None
+
+
+def _update_cold_vram_ema(vram_gb: float) -> None:
+    """Update the EMA of VRAM consumed per cold worker."""
+    global _cold_vram_ema_gb
+    if vram_gb <= 0:
+        return
+    if _cold_vram_ema_gb is None:
+        _cold_vram_ema_gb = vram_gb
+    else:
+        _cold_vram_ema_gb = _COLD_VRAM_EMA_ALPHA * vram_gb + (1.0 - _COLD_VRAM_EMA_ALPHA) * _cold_vram_ema_gb
+
+
+def _update_cold_inference_ema_stt(elapsed: float) -> None:
+    """Update the inference-only EMA for pool workers."""
+    global _cold_inference_ema_stt
+    if _cold_inference_ema_stt is None:
+        _cold_inference_ema_stt = elapsed
+    else:
+        _cold_inference_ema_stt = _COLD_INFERENCE_EMA_ALPHA * elapsed + (1.0 - _COLD_INFERENCE_EMA_ALPHA) * _cold_inference_ema_stt
+
+
+def _vram_per_cold_worker() -> float:
+    """Return estimated VRAM needed per cold worker with safety margin.
+    Uses live EMA once seeded, falls back to MIN_COLD_VRAM_GB."""
+    if _cold_vram_ema_gb is not None:
+        return _cold_vram_ema_gb * _COLD_VRAM_SAFETY_FACTOR
+    return MIN_COLD_VRAM_GB
+
+
+# ── Persistent cold worker class ──────────────────────────────────────────────
+
+class _ColdWorker:
+    """
+    A persistent cold worker subprocess (cold_worker.py).
+
+    The subprocess loads the Whisper model once on startup, then serves
+    successive transcription requests via newline-delimited JSON on stdin/stdout.
+    After each request the caller decides whether to return it to the idle pool
+    or shut it down (if the pool is already full).
+    """
+
+    def __init__(self) -> None:
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self.alive: bool = False
+
+    async def spawn(self) -> bool:
+        """
+        Start the subprocess and wait for the {'ready': true} signal.
+
+        Returns True if the worker loaded successfully and is ready to serve requests.
+        Returns False (and cleans up) on any failure.
+        """
+        env = os.environ.copy()
+        env["WHISPER_CACHE_DIR"] = MODEL_CACHE_DIR
+        env["WHISPER_MODEL"] = model_name
+        env["WHISPER_FP16"] = "1" if WHISPER_FP16 else "0"
+        env["COLD_WORKER_IDLE_TIMEOUT"] = str(COLD_WORKER_IDLE_TIMEOUT)
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                VENV_PYTHON, COLD_WORKER_SCRIPT,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            # Wait up to 90 s for the model to load and the ready signal
+            line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=90.0)
+            msg = json.loads(line)
+            if msg.get("ready"):
+                self.alive = True
+                return True
+        except Exception as exc:
+            print(f"COLD WORKER: spawn failed: {exc}", flush=True)
+            await self.shutdown()
+        return False
+
+    def is_alive(self) -> bool:
+        return self.alive and self._proc is not None and self._proc.returncode is None
+
+    async def transcribe(self, audio_bytes: bytes, language, prompt, temp: float, task: str) -> dict:
+        """Send one request and return the Whisper result dict."""
+        req = {
+            "audio_b64": base64.b64encode(audio_bytes).decode(),
+            "language": language,
+            "prompt": prompt,
+            "temperature": temp,
+            "task": task,
+        }
+        self._proc.stdin.write((json.dumps(req) + "\n").encode())
+        await self._proc.stdin.drain()
+        resp_line = await asyncio.wait_for(
+            self._proc.stdout.readline(), timeout=COLD_LANE_TIMEOUT_SECONDS
+        )
+        resp = json.loads(resp_line)
+        if "error" in resp:
+            self.alive = False
+            raise RuntimeError(f"Cold worker error: {resp['error']}")
+        if resp.get("exit"):
+            self.alive = False
+            raise RuntimeError(f"Cold worker exited unexpectedly: {resp.get('exit')}")
+        return resp["result"]
+
+    async def shutdown(self) -> None:
+        """Send an exit request and wait for the subprocess to terminate."""
+        self.alive = False
+        if self._proc is None or self._proc.returncode is not None:
+            return
+        try:
+            self._proc.stdin.write((json.dumps({"exit": True}) + "\n").encode())
+            await self._proc.stdin.drain()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+        except Exception:
+            pass
+        if self._proc.returncode is None:
+            self._proc.kill()
+
+
+async def _acquire_idle_worker() -> Optional[_ColdWorker]:
+    """
+    Return a live idle worker from the pool, or None if the pool is empty.
+    Silently discards workers that died while idle.
+    """
+    if _cold_idle_pool is None:
+        return None
+    while not _cold_idle_pool.empty():
+        try:
+            worker = _cold_idle_pool.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if worker.is_alive():
+            return worker
+        # Died silently while sitting in the pool (idle timeout, OOM, etc.) — discard
+    return None
+
+
+async def _return_to_pool(worker: _ColdWorker) -> None:
+    """Return a worker to the idle pool, or shut it down if the pool is already full."""
+    if _cold_idle_pool is None or not worker.is_alive():
+        await worker.shutdown()
+        return
+    if _cold_idle_pool.qsize() < COLD_POOL_SIZE:
+        await _cold_idle_pool.put(worker)
+    else:
+        await worker.shutdown()
 
 
 def _update_cold_ema_stt(elapsed: float) -> None:
@@ -292,21 +501,21 @@ def _has_vram_for_cold_lane() -> bool:
     """
     Return True if there is enough free VRAM to load one more cold whisper worker.
 
-    Accounts for in-flight cold workers that have been dispatched but may not have
-    allocated their VRAM yet. Each in-flight worker reserves MIN_COLD_VRAM_GB from the
-    effective free pool, preventing simultaneous Branch C routing decisions from all
-    seeing the same un-allocated free VRAM and collectively over-committing memory.
+    Uses auto-calibrated EMA of measured VRAM per cold worker (_cold_vram_ema_gb × 1.2)
+    once seeded. Falls back to MIN_COLD_VRAM_GB before first cold run completes.
+    Set MIN_COLD_VRAM_GB=0 to disable the check entirely.
 
-    effective_free = gpu_free - (_cold_workers_in_flight × MIN_COLD_VRAM_GB)
-    dispatch cold  if  effective_free >= MIN_COLD_VRAM_GB
+    effective_free = gpu_free - (_cold_workers_in_flight × vram_per_worker)
+    dispatch cold  if  effective_free >= vram_per_worker
     """
     if MIN_COLD_VRAM_GB <= 0:
         return True  # check disabled via env var
     free = _free_vram_gb()
     if free is None:
         return True  # CPU mode: no VRAM constraint
-    effective_free = free - (_cold_workers_in_flight * MIN_COLD_VRAM_GB)
-    return effective_free >= MIN_COLD_VRAM_GB
+    needed = _vram_per_cold_worker()
+    effective_free = free - (_cold_workers_in_flight * needed)
+    return effective_free >= needed
 
 
 def _get_audio_duration(audio_bytes: bytes) -> float:
@@ -356,9 +565,13 @@ def _should_queue_hot_stt(audio_duration: float) -> bool:
 # 3. Transcription Functions
 # -------------------------------
 
-def _run_hot_locked(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float, task: str = "transcribe") -> dict:
+def _run_hot_locked(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float, task: str = "transcribe") -> tuple:
     """
     Acquire model_lock, transcribe, release — all inside a single thread.
+
+    Returns (result, processing_elapsed) where processing_elapsed is the time spent
+    actually running the model (after acquiring the lock), excluding queue wait time.
+    Callers must unpack: result, proc_elapsed = await asyncio.to_thread(_run_hot_locked, ...)
 
     This function is always called via asyncio.to_thread(). Keeping acquire and release
     in the same thread call guarantees the lock is released even if the calling coroutine
@@ -368,8 +581,10 @@ def _run_hot_locked(audio_bytes: bytes, language: Optional[str], prompt: Optiona
     acquired, deadlocking the server.
     """
     model_lock.acquire()
+    t_proc = time.monotonic()
     try:
-        return run_transcription_fast_lane(audio_bytes, language, prompt, temp, task)
+        result = run_transcription_fast_lane(audio_bytes, language, prompt, temp, task)
+        return result, time.monotonic() - t_proc
     finally:
         model_lock.release()
 
@@ -387,78 +602,34 @@ def run_transcription_fast_lane(audio_bytes: bytes, language: Optional[str], pro
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
-async def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str], prompt: Optional[str], temp: float, task: str = "transcribe") -> dict:
-    log_debug(f"--- CHILD LANE: Spawning new cold worker, task={task}... ---")
-    t_audio = None
-    r_path = None
+async def _spawn_cold_worker_with_vram(task_label: str = "") -> _ColdWorker:
+    """
+    Spawn a new _ColdWorker, wait for it to load the model, measure VRAM consumption,
+    and return the ready worker. Manages _cold_workers_in_flight accounting.
+
+    Raises RuntimeError if the worker fails to start.
+    """
+    global _cold_workers_in_flight
+    v_before = _free_vram_gb() or 0.0
+    _cold_workers_in_flight += 1
+    worker = _ColdWorker()
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=MODEL_CACHE_DIR) as t:
-            t.write(audio_bytes)
-            t_audio = t.name
-
-        sub_env = os.environ.copy()
-        sub_env["WHISPER_CACHE_DIR"] = MODEL_CACHE_DIR
-
-        cmd = [
-            VENV_PYTHON, WHISPER_SCRIPT, t_audio,
-            "--model", model_name,
-            "--output_format", "json",
-            "--output_dir", MODEL_CACHE_DIR,
-            "--temperature", str(temp),
-            "--fp16", "True" if (torch.cuda.is_available() and WHISPER_FP16) else "False"
-        ]
-        if language: cmd.extend(["--language", language])
-        if prompt: cmd.extend(["--initial_prompt", prompt])
-        if task == "translate": cmd.extend(["--task", "translate"])
-
-        # New in 1.2.3: Print the exact shell command if DEBUG=true
-        log_debug(f"DEBUG EXEC: {' '.join(cmd)}")
-
-        # v1.3.2: asyncio.create_subprocess_exec + wait_for timeout replaces blocking subprocess.run().
-        # This prevents a hung subprocess (OOM, driver crash) from blocking the server indefinitely.
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=sub_env
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=COLD_LANE_TIMEOUT_SECONDS
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.communicate()
-            raise RuntimeError(f"Cold Lane subprocess timed out after {COLD_LANE_TIMEOUT_SECONDS}s")
-
-        if process.returncode != 0:
-            # v1.3.1: Full detail is logged but NOT sent to the client to avoid path/info leakage.
-            print(f"COLD LANE ERROR (exit {process.returncode}): {stderr.decode()}", flush=True)
-            raise RuntimeError(f"Cold Lane transcription failed (subprocess exited {process.returncode})")
-
-        if DEBUG_MODE:
-            print(f"COLD LANE STDOUT: {stdout.decode()}", flush=True)
-
-        f_base, _ = os.path.splitext(os.path.basename(t_audio))
-        r_path = os.path.join(MODEL_CACHE_DIR, f_base + ".json")
-
-        if not os.path.exists(r_path):
-            # exit 0 but no JSON written — whisper produced no segments (inaudible/empty audio)
-            # or was killed by the OS before flushing output. Log for diagnostics.
-            print(
-                f"COLD LANE WARNING: exit 0 but JSON not found ({r_path}). "
-                f"stdout={stdout.decode()[:300]!r} stderr={stderr.decode()[:300]!r}",
-                flush=True
-            )
-            raise RuntimeError(f"Cold Lane produced no output (exit 0, JSON missing)")
-
-        with open(r_path, 'r') as f:
-            data = json.load(f)
-        return data
-    finally:
-        if t_audio and os.path.exists(t_audio): os.remove(t_audio)
-        if r_path and os.path.exists(r_path): os.remove(r_path)
-        log_debug(f"--- CHILD LANE: Cleanup complete. ---")
+        spawned = await worker.spawn()
+        if not spawned:
+            raise RuntimeError("Cold worker subprocess failed to start")
+        # Model is now loaded: measure VRAM drop (only accurate when we are the sole spawner)
+        if _cold_workers_in_flight == 1:
+            v_after = _free_vram_gb() or 0.0
+            drop = v_before - v_after
+            if drop > 0:
+                _update_cold_vram_ema(drop)
+                log_debug(f"--- COLD VRAM: drop={drop:.2f} GB → EMA={_cold_vram_ema_gb:.2f} GB{' ' + task_label if task_label else ''} ---")
+        _cold_workers_in_flight -= 1
+        return worker
+    except Exception:
+        _cold_workers_in_flight -= 1
+        await worker.shutdown()
+        raise
 
 # -------------------------------
 # 3b. Startup EMA Warmup
@@ -535,7 +706,12 @@ async def health_check():
         "hot_queue_drain_estimate_seconds": round(_hot_queue_audio_seconds * _hot_ema_sps, 2) if _hot_ema_sps else None,
         "vram_free_gb": round(_free, 2) if _free is not None else None,
         "min_cold_vram_gb": MIN_COLD_VRAM_GB,
+        "cold_vram_ema_gb": round(_cold_vram_ema_gb, 3) if _cold_vram_ema_gb is not None else None,
+        "cold_vram_per_worker_gb": round(_vram_per_cold_worker(), 3),
         "cold_workers_in_flight": _cold_workers_in_flight,
+        "cold_pool_idle": _cold_idle_pool.qsize() if _cold_idle_pool is not None else 0,
+        "cold_pool_size": COLD_POOL_SIZE,
+        "cold_inference_ema_seconds": round(_cold_inference_ema_stt, 2) if _cold_inference_ema_stt is not None else None,
         "vram_sufficient_for_cold": _has_vram_for_cold_lane(),
     }
     return {
@@ -561,9 +737,12 @@ async def create_transcription(
         contents = await file.read()
         audio_dur = _get_audio_duration(contents)
         global _hot_queue_audio_seconds
+        route = "HOT-A"
+
         if model_lock.acquire(blocking=False):
             # ── Branch A: hot lane free → use immediately ────────────────────
-            log_debug(f"--- ROUTER: Hot lane free. Routing direct. audio={audio_dur:.1f}s ---")
+            route = "HOT-A"
+            log_debug(f"--- ROUTER: Hot lane free. audio={audio_dur:.1f}s ---")
             _hot_queue_audio_seconds += audio_dur
             t0 = time.monotonic()
             try:
@@ -573,65 +752,72 @@ async def create_transcription(
                 _hot_queue_audio_seconds -= audio_dur
                 model_lock.release()
 
-        elif _should_queue_hot_stt(audio_dur):
-            # ── Branch B: hot lane busy but cheaper to wait ──────────────────
-            drain_est = _hot_queue_audio_seconds * _hot_ema_sps
-            threshold = _get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR
-            log_debug(f"--- ROUTER: Smart routing → queue hot lane. drain_est={drain_est:.1f}s < threshold={threshold:.1f}s. audio={audio_dur:.1f}s ---")
-            _hot_queue_audio_seconds += audio_dur
-            t0 = time.monotonic()
-            try:
-                # _run_hot_locked acquires, transcribes, and releases the lock inside a single
-                # thread — safe against asyncio task cancellation (client timeout). A two-step
-                # acquire-then-release pattern leaves the lock acquired if the coroutine is
-                # cancelled between the two awaits, deadlocking the server.
-                res = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
-                _update_hot_ema_stt(time.monotonic() - t0, audio_dur)
-            finally:
-                _hot_queue_audio_seconds -= audio_dur
-
         else:
-            # ── Branch C: hot lane busy, cold lane is faster ─────────────────
-            global _cold_workers_in_flight
-            free_gb = _free_vram_gb()
-            vram_ok = _has_vram_for_cold_lane()
-            if not vram_ok:
-                # Insufficient VRAM — skip cold subprocess entirely and queue hot directly.
-                # Avoids the 8-10s wasted on a model load that will OOM mid-way.
-                print(f"--- ROUTER: Insufficient VRAM ({free_gb:.1f} GB free < {MIN_COLD_VRAM_GB} GB required) → queuing hot lane. audio={audio_dur:.1f}s ---", flush=True)
-                _hot_queue_audio_seconds += audio_dur
-                t0 = time.monotonic()
+            idle_worker = await _acquire_idle_worker()
+            if idle_worker is not None:
+                # ── Branch 0: idle pool worker available ─────────────────────
+                route = "COLD-POOL"
+                log_debug(f"--- ROUTER: Pool worker available → COLD-POOL. audio={audio_dur:.1f}s ---")
+                t_infer = time.monotonic()
                 try:
-                    res = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
-                    _update_hot_ema_stt(time.monotonic() - t0, audio_dur)
+                    res = await idle_worker.transcribe(contents, language, prompt, temperature, "transcribe")
+                    _update_cold_inference_ema_stt(time.monotonic() - t_infer)
+                    await _return_to_pool(idle_worker)
+                except Exception as pool_err:
+                    route = "COLD-POOL→HOT"
+                    print(f"--- ROUTER: Pool worker failed ({pool_err}). Falling back to hot lane. audio={audio_dur:.1f}s ---", flush=True)
+                    _hot_queue_audio_seconds += audio_dur
+                    try:
+                        res, _ = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
+                    finally:
+                        _hot_queue_audio_seconds -= audio_dur
+
+            elif _should_queue_hot_stt(audio_dur):
+                # ── Branch B: hot lane busy but cheaper to wait ──────────────
+                route = "HOT-B"
+                drain_est = _hot_queue_audio_seconds * _hot_ema_sps
+                threshold = _get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR
+                log_debug(f"--- ROUTER: Queue hot. drain_est={drain_est:.1f}s < threshold={threshold:.1f}s. audio={audio_dur:.1f}s ---")
+                _hot_queue_audio_seconds += audio_dur
+                try:
+                    res, proc_elapsed = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
+                    _update_hot_ema_stt(proc_elapsed, audio_dur)
                 finally:
                     _hot_queue_audio_seconds -= audio_dur
-            else:
+
+            elif _has_vram_for_cold_lane():
+                # ── Branch C: spawn new cold worker ─────────────────────────
+                route = "COLD"
                 if DEBUG_MODE:
+                    free_gb = _free_vram_gb()
                     drain_est = (_hot_queue_audio_seconds * _hot_ema_sps) if _hot_ema_sps else None
                     vram_str = f"{free_gb:.1f} GB free ({_cold_workers_in_flight} in-flight)" if free_gb is not None else "VRAM unknown"
                     if drain_est is not None:
-                        print(f"--- ROUTER: Smart routing → cold lane. drain_est={drain_est:.1f}s ≥ threshold={_get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR:.1f}s. {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
+                        print(f"--- ROUTER: Spawn cold. drain_est={drain_est:.1f}s ≥ threshold={_get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR:.1f}s. {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
                     else:
-                        print(f"--- ROUTER: EMA not calibrated → cold lane. {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
-                _cold_workers_in_flight += 1
-                t_cold = time.monotonic()
+                        print(f"--- ROUTER: EMA uncalibrated → cold lane. {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
+                t_start = time.monotonic()
                 try:
-                    res = await run_transcription_slow_lane(contents, language, prompt, temperature)
-                    _update_cold_ema_stt(time.monotonic() - t_cold)
+                    worker = await _spawn_cold_worker_with_vram()
+                    t_infer = time.monotonic()
+                    try:
+                        res = await worker.transcribe(contents, language, prompt, temperature, "transcribe")
+                        inference_elapsed = time.monotonic() - t_infer
+                        _update_cold_ema_stt(time.monotonic() - t_start)
+                        _update_cold_inference_ema_stt(inference_elapsed)
+                        await _return_to_pool(worker)
+                    except Exception as infer_err:
+                        await worker.shutdown()
+                        raise infer_err
                 except Exception as cold_err:
-                    # ── Branch C fallback: cold lane failed → queue for hot lane ──
-                    # Should be rare now that the VRAM check prevents predictable OOMs.
-                    print(f"--- ROUTER: Cold lane failed ({cold_err}). Falling back to hot lane queue. audio={audio_dur:.1f}s ---", flush=True)
+                    route = "COLD→HOT"
+                    print(f"--- ROUTER: Cold lane failed ({cold_err}). Falling back to hot lane. audio={audio_dur:.1f}s ---", flush=True)
                     _hot_queue_audio_seconds += audio_dur
                     try:
-                        # Note: EMA is NOT updated here — fallback elapsed includes cold-lane failure time.
-                        # Retry up to 3 times with exponential backoff for transient CUDA errors
-                        # (e.g. cuDNN/CUBLAS errors caused by VRAM pressure from dying cold workers).
                         _fallback_delay = 1.0
                         for _attempt in range(3):
                             try:
-                                res = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
+                                res, _ = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
                                 break
                             except Exception as hot_err:
                                 _err_str = str(hot_err)
@@ -646,10 +832,24 @@ async def create_transcription(
                                     raise
                     finally:
                         _hot_queue_audio_seconds -= audio_dur
-                finally:
-                    _cold_workers_in_flight -= 1
 
-        return res["text"] if response_format == "text" else res
+            else:
+                # ── Branch D: insufficient VRAM → queue hot ──────────────────
+                route = "HOT-C"
+                free_gb = _free_vram_gb()
+                print(f"--- ROUTER: Insufficient VRAM ({free_gb:.1f} GB free) → queuing hot lane. audio={audio_dur:.1f}s ---", flush=True)
+                _hot_queue_audio_seconds += audio_dur
+                try:
+                    res, proc_elapsed = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
+                    _update_hot_ema_stt(proc_elapsed, audio_dur)
+                finally:
+                    _hot_queue_audio_seconds -= audio_dur
+
+        data = res["text"] if response_format == "text" else res
+        if response_format == "text":
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(content=data, headers={"X-Route": route})
+        return JSONResponse(content=data, headers={"X-Route": route})
     except Exception as e:
         print(f"ERROR in create_transcription: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Transcription failed. Check server logs.")
@@ -673,9 +873,12 @@ async def create_translation(
         contents = await file.read()
         audio_dur = _get_audio_duration(contents)
         global _hot_queue_audio_seconds
+        route = "HOT-A"
+
         if model_lock.acquire(blocking=False):
             # ── Branch A: hot lane free → use immediately ────────────────────
-            log_debug(f"--- ROUTER: Hot lane free. Routing translation direct. audio={audio_dur:.1f}s ---")
+            route = "HOT-A"
+            log_debug(f"--- ROUTER: Hot lane free (translation). audio={audio_dur:.1f}s ---")
             _hot_queue_audio_seconds += audio_dur
             t0 = time.monotonic()
             try:
@@ -685,54 +888,72 @@ async def create_translation(
                 _hot_queue_audio_seconds -= audio_dur
                 model_lock.release()
 
-        elif _should_queue_hot_stt(audio_dur):
-            # ── Branch B: hot lane busy but cheaper to wait ──────────────────
-            drain_est = _hot_queue_audio_seconds * _hot_ema_sps
-            threshold = _get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR
-            log_debug(f"--- ROUTER: Smart routing → queue hot lane (translation). drain_est={drain_est:.1f}s < threshold={threshold:.1f}s. audio={audio_dur:.1f}s ---")
-            _hot_queue_audio_seconds += audio_dur
-            t0 = time.monotonic()
-            try:
-                res = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
-                _update_hot_ema_stt(time.monotonic() - t0, audio_dur)
-            finally:
-                _hot_queue_audio_seconds -= audio_dur
-
         else:
-            # ── Branch C: hot lane busy, cold lane is faster ─────────────────
-            global _cold_workers_in_flight
-            free_gb = _free_vram_gb()
-            vram_ok = _has_vram_for_cold_lane()
-            if not vram_ok:
-                print(f"--- ROUTER: Insufficient VRAM ({free_gb:.1f} GB free < {MIN_COLD_VRAM_GB} GB required) → queuing hot lane (translation). audio={audio_dur:.1f}s ---", flush=True)
-                _hot_queue_audio_seconds += audio_dur
-                t0 = time.monotonic()
+            idle_worker = await _acquire_idle_worker()
+            if idle_worker is not None:
+                # ── Branch 0: idle pool worker available ─────────────────────
+                route = "COLD-POOL"
+                log_debug(f"--- ROUTER: Pool worker available → COLD-POOL (translation). audio={audio_dur:.1f}s ---")
+                t_infer = time.monotonic()
                 try:
-                    res = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
-                    _update_hot_ema_stt(time.monotonic() - t0, audio_dur)
+                    res = await idle_worker.transcribe(contents, None, prompt, temperature, "translate")
+                    _update_cold_inference_ema_stt(time.monotonic() - t_infer)
+                    await _return_to_pool(idle_worker)
+                except Exception as pool_err:
+                    route = "COLD-POOL→HOT"
+                    print(f"--- ROUTER: Pool worker failed ({pool_err}). Falling back to hot lane (translation). audio={audio_dur:.1f}s ---", flush=True)
+                    _hot_queue_audio_seconds += audio_dur
+                    try:
+                        res, _ = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
+                    finally:
+                        _hot_queue_audio_seconds -= audio_dur
+
+            elif _should_queue_hot_stt(audio_dur):
+                # ── Branch B: hot lane busy but cheaper to wait ──────────────
+                route = "HOT-B"
+                drain_est = _hot_queue_audio_seconds * _hot_ema_sps
+                threshold = _get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR
+                log_debug(f"--- ROUTER: Queue hot (translation). drain_est={drain_est:.1f}s < threshold={threshold:.1f}s. audio={audio_dur:.1f}s ---")
+                _hot_queue_audio_seconds += audio_dur
+                try:
+                    res, proc_elapsed = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
+                    _update_hot_ema_stt(proc_elapsed, audio_dur)
                 finally:
                     _hot_queue_audio_seconds -= audio_dur
-            else:
+
+            elif _has_vram_for_cold_lane():
+                # ── Branch C: spawn new cold worker ─────────────────────────
+                route = "COLD"
                 if DEBUG_MODE:
+                    free_gb = _free_vram_gb()
                     drain_est = (_hot_queue_audio_seconds * _hot_ema_sps) if _hot_ema_sps else None
                     vram_str = f"{free_gb:.1f} GB free ({_cold_workers_in_flight} in-flight)" if free_gb is not None else "VRAM unknown"
                     if drain_est is not None:
-                        print(f"--- ROUTER: Smart routing → cold lane (translation). drain_est={drain_est:.1f}s ≥ threshold={_get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR:.1f}s. {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
+                        print(f"--- ROUTER: Spawn cold (translation). drain_est={drain_est:.1f}s ≥ threshold={_get_cold_start_time_stt() * HOT_QUEUE_SAFETY_FACTOR:.1f}s. {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
                     else:
-                        print(f"--- ROUTER: EMA not calibrated → cold lane (translation). {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
-                _cold_workers_in_flight += 1
-                t_cold = time.monotonic()
+                        print(f"--- ROUTER: EMA uncalibrated → cold lane (translation). {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
+                t_start = time.monotonic()
                 try:
-                    res = await run_transcription_slow_lane(contents, None, prompt, temperature, "translate")
-                    _update_cold_ema_stt(time.monotonic() - t_cold)
+                    worker = await _spawn_cold_worker_with_vram("(translation)")
+                    t_infer = time.monotonic()
+                    try:
+                        res = await worker.transcribe(contents, None, prompt, temperature, "translate")
+                        inference_elapsed = time.monotonic() - t_infer
+                        _update_cold_ema_stt(time.monotonic() - t_start)
+                        _update_cold_inference_ema_stt(inference_elapsed)
+                        await _return_to_pool(worker)
+                    except Exception as infer_err:
+                        await worker.shutdown()
+                        raise infer_err
                 except Exception as cold_err:
-                    print(f"--- ROUTER: Cold lane failed ({cold_err}). Falling back to hot lane queue (translation). audio={audio_dur:.1f}s ---", flush=True)
+                    route = "COLD→HOT"
+                    print(f"--- ROUTER: Cold lane failed ({cold_err}). Falling back to hot lane (translation). audio={audio_dur:.1f}s ---", flush=True)
                     _hot_queue_audio_seconds += audio_dur
                     try:
                         _fallback_delay = 1.0
                         for _attempt in range(3):
                             try:
-                                res = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
+                                res, _ = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
                                 break
                             except Exception as hot_err:
                                 _err_str = str(hot_err)
@@ -747,10 +968,24 @@ async def create_translation(
                                     raise
                     finally:
                         _hot_queue_audio_seconds -= audio_dur
-                finally:
-                    _cold_workers_in_flight -= 1
 
-        return res["text"] if response_format == "text" else res
+            else:
+                # ── Branch D: insufficient VRAM → queue hot ──────────────────
+                route = "HOT-C"
+                free_gb = _free_vram_gb()
+                print(f"--- ROUTER: Insufficient VRAM ({free_gb:.1f} GB free) → queuing hot lane (translation). audio={audio_dur:.1f}s ---", flush=True)
+                _hot_queue_audio_seconds += audio_dur
+                try:
+                    res, proc_elapsed = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
+                    _update_hot_ema_stt(proc_elapsed, audio_dur)
+                finally:
+                    _hot_queue_audio_seconds -= audio_dur
+
+        data = res["text"] if response_format == "text" else res
+        if response_format == "text":
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(content=data, headers={"X-Route": route})
+        return JSONResponse(content=data, headers={"X-Route": route})
     except Exception as e:
         print(f"ERROR in create_translation: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Translation failed. Check server logs.")
