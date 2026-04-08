@@ -14,11 +14,17 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.5.1
+# Version: 1.5.2
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.5.2 (2026-04-08): Serial cold spawning via _cold_spawn_lock (asyncio.Lock). Branch C
+#   now checks _cold_spawn_lock.locked() before spawning: if another worker is already loading,
+#   the request goes to HOT-C instead of spawning a concurrent loader. Prevents CUDA contention
+#   between simultaneous cold workers whose combined load time far exceeds the calibrated
+#   cold_ema (measured with a single uncontested worker). Once loaded, the worker enters the
+#   pool and serves subsequent requests at inference-only cost via Branch 0 (COLD-POOL).
 # - 1.5.1 (2026-04-08): Cold EMA startup warmup + unified inference EMA. At startup, a cold
 #   worker is spawned, a silence clip is transcribed through it to measure total cold start
 #   time (load + inference), cold_ema is seeded, VRAM drop measured, then the worker is killed.
@@ -164,7 +170,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.5.1"
+SERVER_VERSION = "1.5.2"
 
 # BASE_DIR is the directory containing this script. All local paths are relative to it,
 # allowing no-sudo installation as any user (mirrors coqui-tts-local-server pattern).
@@ -249,8 +255,9 @@ model_lock = threading.Lock()
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    global _cold_idle_pool
+    global _cold_idle_pool, _cold_spawn_lock
     _cold_idle_pool = asyncio.Queue()
+    _cold_spawn_lock = asyncio.Lock()
     await _warmup_ema()
     await _warmup_cold_ema()
     yield
@@ -325,9 +332,15 @@ _cold_vram_ema_gb: Optional[float] = None
 _COLD_VRAM_EMA_ALPHA = 0.3
 _COLD_VRAM_SAFETY_FACTOR = 1.2  # 20% headroom above measured EMA
 
-# EMA of inference-only time for pool workers (model already loaded, no spawn overhead).
 # asyncio.Queue of idle _ColdWorker instances. Initialised in _lifespan (requires event loop).
 _cold_idle_pool: Optional[asyncio.Queue] = None
+
+# Lock that ensures at most one cold worker spawns at a time.
+# While a worker is loading the model, any further Branch C decisions route to HOT-C instead
+# of spawning a second concurrent loader, preventing CUDA contention that would inflate load
+# times far beyond the calibrated cold_ema and invalidate the routing threshold.
+# Initialised in _lifespan alongside _cold_idle_pool.
+_cold_spawn_lock: Optional[asyncio.Lock] = None
 
 
 def _update_cold_vram_ema(vram_gb: float) -> None:
@@ -826,8 +839,10 @@ async def create_transcription(
                 finally:
                     _hot_queue_audio_seconds -= audio_dur
 
-            elif _has_vram_for_cold_lane():
+            elif _has_vram_for_cold_lane() and not _cold_spawn_lock.locked():
                 # ── Branch C: spawn new cold worker ─────────────────────────
+                # _cold_spawn_lock ensures only one worker loads at a time, preventing
+                # CUDA contention that inflates load time beyond the calibrated cold_ema.
                 route = "COLD"
                 if DEBUG_MODE:
                     free_gb = _free_vram_gb()
@@ -839,8 +854,8 @@ async def create_transcription(
                         print(f"--- ROUTER: EMA uncalibrated → cold lane. {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
                 t_start = time.monotonic()
                 try:
-                    worker = await _spawn_cold_worker_with_vram()
-                    t_infer = time.monotonic()
+                    async with _cold_spawn_lock:
+                        worker = await _spawn_cold_worker_with_vram()
                     try:
                         res = await worker.transcribe(contents, language, prompt, temperature, "transcribe")
                         _update_cold_ema_stt(time.monotonic() - t_start)
@@ -873,10 +888,12 @@ async def create_transcription(
                         _hot_queue_audio_seconds -= audio_dur
 
             else:
-                # ── Branch D: insufficient VRAM → queue hot ──────────────────
+                # ── Branch D: VRAM insufficient or spawn already in progress → queue hot ──
                 route = "HOT-C"
                 free_gb = _free_vram_gb()
-                print(f"--- ROUTER: Insufficient VRAM ({free_gb:.1f} GB free) → queuing hot lane. audio={audio_dur:.1f}s ---", flush=True)
+                spawning = _cold_spawn_lock.locked() if _cold_spawn_lock else False
+                reason = "spawn in progress" if spawning else f"VRAM {free_gb:.1f}GB insufficient"
+                log_debug(f"--- ROUTER: {reason} → queuing hot lane. audio={audio_dur:.1f}s ---")
                 _hot_queue_audio_seconds += audio_dur
                 try:
                     res, proc_elapsed = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
@@ -959,7 +976,7 @@ async def create_translation(
                 finally:
                     _hot_queue_audio_seconds -= audio_dur
 
-            elif _has_vram_for_cold_lane():
+            elif _has_vram_for_cold_lane() and not _cold_spawn_lock.locked():
                 # ── Branch C: spawn new cold worker ─────────────────────────
                 route = "COLD"
                 if DEBUG_MODE:
@@ -972,8 +989,8 @@ async def create_translation(
                         print(f"--- ROUTER: EMA uncalibrated → cold lane (translation). {vram_str}. audio={audio_dur:.1f}s ---", flush=True)
                 t_start = time.monotonic()
                 try:
-                    worker = await _spawn_cold_worker_with_vram("(translation)")
-                    t_infer = time.monotonic()
+                    async with _cold_spawn_lock:
+                        worker = await _spawn_cold_worker_with_vram("(translation)")
                     try:
                         res = await worker.transcribe(contents, None, prompt, temperature, "translate")
                         _update_cold_ema_stt(time.monotonic() - t_start)
@@ -1006,10 +1023,12 @@ async def create_translation(
                         _hot_queue_audio_seconds -= audio_dur
 
             else:
-                # ── Branch D: insufficient VRAM → queue hot ──────────────────
+                # ── Branch D: VRAM insufficient or spawn already in progress → queue hot ──
                 route = "HOT-C"
                 free_gb = _free_vram_gb()
-                print(f"--- ROUTER: Insufficient VRAM ({free_gb:.1f} GB free) → queuing hot lane (translation). audio={audio_dur:.1f}s ---", flush=True)
+                spawning = _cold_spawn_lock.locked() if _cold_spawn_lock else False
+                reason = "spawn in progress" if spawning else f"VRAM {free_gb:.1f}GB insufficient"
+                log_debug(f"--- ROUTER: {reason} → queuing hot lane (translation). audio={audio_dur:.1f}s ---")
                 _hot_queue_audio_seconds += audio_dur
                 try:
                     res, proc_elapsed = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
