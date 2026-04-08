@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.10] - 2026-04-08
+
+### Fixed
+- **Fallback hot lane retry on transient CUDA errors:** When cold lane fails and the request is rerouted to the hot lane, the hot lane inference now retries up to 3 times with exponential backoff (1 s, 2 s) when it encounters a transient CUDA error (`cuDNN`, `CUBLAS`, `CUDA error`, `out of memory`). Without this, dying cold lane subprocesses (OOM) cause brief CUDA context pressure that manifests as transient errors on the first hot lane attempt, turning what should be a transparent fallback into an HTTP 500. Validated: 4-wave stress test of 40 clips went from 36/40 to 40/40 OK with zero HTTP errors after the fix. Applied to both `/v1/audio/transcriptions` and `/v1/audio/translations`.
+
+## [1.4.9] - 2026-04-08
+
+### Changed
+- **Cold lane subprocess now passes `--fp16 True/False` matching `WHISPER_FP16`:** The `venv/bin/whisper` CLI call in Branch C now includes `--fp16 True` when CUDA is available and `WHISPER_FP16=1`, or `--fp16 False` otherwise. This aligns the inference precision of cold workers with the hot worker setting and avoids the precision mismatch warning from newer openai-whisper releases (>=20240930) that dropped automatic fp16 inference.
+
 ## [1.4.8] - 2026-04-08
 
 ### Added

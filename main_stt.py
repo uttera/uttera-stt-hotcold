@@ -14,11 +14,19 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.4.8
+# Version: 1.4.10
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.4.10 (2026-04-08): Fallback hot lane retry on transient CUDA errors. When cold lane fails
+#   and the hot lane fallback hits a cuDNN/CUBLAS/OOM error (caused by VRAM pressure from dying
+#   cold workers not yet released by the driver), retries up to 3 times with exponential backoff
+#   (1s, 2s) before giving up. Applied to both transcription and translation endpoints.
+# - 1.4.9 (2026-04-08): Cold lane subprocess now passes --fp16 True/False matching WHISPER_FP16.
+#   openai-whisper >=20240930 dropped automatic fp16 in the CLI, causing cold workers to load
+#   in fp32 (~4.8 GB vs ~1.5 GB in fp16). This restores parity with the hot worker and prevents
+#   cascading OOM under concurrent cold lane load.
 # - 1.4.8 (2026-04-08): WHISPER_FP16 env var (default "1"). When CUDA is available and
 #   WHISPER_FP16=1, the hot-worker model loads on CPU in fp16 then moves to GPU, with
 #   LayerNorm weights kept in fp32 to avoid dtype mismatch (whisper LayerNorm does x.float()
@@ -123,7 +131,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.4.8"
+SERVER_VERSION = "1.4.10"
 
 # BASE_DIR is the directory containing this script. All local paths are relative to it,
 # allowing no-sudo installation as any user (mirrors coqui-tts-local-server pattern).
@@ -396,7 +404,8 @@ async def run_transcription_slow_lane(audio_bytes: bytes, language: Optional[str
             "--model", model_name,
             "--output_format", "json",
             "--output_dir", MODEL_CACHE_DIR,
-            "--temperature", str(temp)
+            "--temperature", str(temp),
+            "--fp16", "True" if (torch.cuda.is_available() and WHISPER_FP16) else "False"
         ]
         if language: cmd.extend(["--language", language])
         if prompt: cmd.extend(["--initial_prompt", prompt])
@@ -617,7 +626,24 @@ async def create_transcription(
                     _hot_queue_audio_seconds += audio_dur
                     try:
                         # Note: EMA is NOT updated here — fallback elapsed includes cold-lane failure time.
-                        res = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
+                        # Retry up to 3 times with exponential backoff for transient CUDA errors
+                        # (e.g. cuDNN/CUBLAS errors caused by VRAM pressure from dying cold workers).
+                        _fallback_delay = 1.0
+                        for _attempt in range(3):
+                            try:
+                                res = await asyncio.to_thread(_run_hot_locked, contents, language, prompt, temperature)
+                                break
+                            except Exception as hot_err:
+                                _err_str = str(hot_err)
+                                _is_cuda_transient = any(k in _err_str for k in (
+                                    "cuDNN", "CUBLAS", "CUDA error", "out of memory"
+                                ))
+                                if _is_cuda_transient and _attempt < 2:
+                                    print(f"--- FALLBACK HOT LANE: transient CUDA error (attempt {_attempt+1}/3), retrying in {_fallback_delay:.1f}s: {hot_err} ---", flush=True)
+                                    await asyncio.sleep(_fallback_delay)
+                                    _fallback_delay *= 2
+                                else:
+                                    raise
                     finally:
                         _hot_queue_audio_seconds -= audio_dur
                 finally:
@@ -703,7 +729,22 @@ async def create_translation(
                     print(f"--- ROUTER: Cold lane failed ({cold_err}). Falling back to hot lane queue (translation). audio={audio_dur:.1f}s ---", flush=True)
                     _hot_queue_audio_seconds += audio_dur
                     try:
-                        res = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
+                        _fallback_delay = 1.0
+                        for _attempt in range(3):
+                            try:
+                                res = await asyncio.to_thread(_run_hot_locked, contents, None, prompt, temperature, "translate")
+                                break
+                            except Exception as hot_err:
+                                _err_str = str(hot_err)
+                                _is_cuda_transient = any(k in _err_str for k in (
+                                    "cuDNN", "CUBLAS", "CUDA error", "out of memory"
+                                ))
+                                if _is_cuda_transient and _attempt < 2:
+                                    print(f"--- FALLBACK HOT LANE: transient CUDA error (attempt {_attempt+1}/3), retrying in {_fallback_delay:.1f}s: {hot_err} ---", flush=True)
+                                    await asyncio.sleep(_fallback_delay)
+                                    _fallback_delay *= 2
+                                else:
+                                    raise
                     finally:
                         _hot_queue_audio_seconds -= audio_dur
                 finally:
