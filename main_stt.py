@@ -265,6 +265,7 @@ class _WorkItem:
     audio_dur: float    # estimated audio duration in seconds
     future: asyncio.Future
     route: str = dataclasses.field(default="HOT")  # set by whichever worker serves it
+    retried: bool = dataclasses.field(default=False)  # True if re-queued after pool worker failure
 
 
 def _update_cold_vram_ema(vram_gb: float) -> None:
@@ -526,7 +527,7 @@ async def _hot_worker_loop() -> None:
     global _work_queue_audio_seconds
     while True:
         item = await _work_queue.get()
-        item.route = "HOT"
+        item.route = "COLD-POOL>HOT" if item.retried else "HOT"
         try:
             result, elapsed = await asyncio.to_thread(
                 _run_hot_locked, item.audio_bytes, item.language, item.prompt, item.temperature, item.task
@@ -565,6 +566,7 @@ async def _pool_worker_loop(worker: _ColdWorker) -> None:
                 break
 
             item.route = "COLD-POOL"
+            requeued = False
             try:
                 result = await worker.transcribe(
                     item.audio_bytes, item.language, item.prompt, item.temperature, item.task
@@ -576,14 +578,18 @@ async def _pool_worker_loop(worker: _ColdWorker) -> None:
                     item.future.cancel()
                 raise  # finally handles decrement
             except Exception as e:
-                print(f"--- POOL WORKER: transcribe failed: {e} ---", flush=True)
+                print(f"--- POOL WORKER: transcribe failed ({e}), re-queuing to hot lane ---", flush=True)
                 if not item.future.done():
-                    item.future.set_exception(e)
-                # finally will decrement; break exits the while loop after finally runs
+                    # Re-queue for the hot worker to rescue — don't decrement accounting
+                    item.retried = True
+                    _work_queue_audio_seconds += item.audio_dur  # restore before finally decrements
+                    await _work_queue.put(item)
+                    requeued = True
                 if not worker.is_alive():
                     break
             finally:
-                _work_queue_audio_seconds -= item.audio_dur
+                if not requeued:
+                    _work_queue_audio_seconds -= item.audio_dur
     finally:
         await worker.shutdown()
 
