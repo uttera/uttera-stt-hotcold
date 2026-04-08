@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.8] - 2026-04-08
+
+### Added
+- **`WHISPER_FP16` env var (default `"1"`):** When CUDA is available and `WHISPER_FP16=1`, the hot-worker model is loaded on CPU in fp16 and then moved to GPU, with `LayerNorm` weights kept in fp32. This is required because Whisper's `LayerNorm` calls `x.float()` internally — if the weights are also fp16, PyTorch raises a dtype mismatch at runtime. The result is ~2912 MiB less VRAM reserved for `whisper-medium` (1466 MiB vs 4378 MiB, −66.5%), measured on RTX 5090 with Python 3.12.3 / torch 2.11.0+cu130. Set `WHISPER_FP16=0` to revert to the original fp32 loading path (e.g. for debugging or CPU-only deployments).
+
 ## [1.4.7] - 2026-04-07
 
 ### Fixed
