@@ -1,15 +1,12 @@
 # Dockerfile for Whisper STT Local Server
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# Ubuntu 24.10 + torch cu130 (CUDA runtime bundled in wheel — no nvidia base needed)
+FROM ubuntu:24.04
 
-# Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies
+# System deps: python3.12 is the default in 24.10
 RUN apt-get update && apt-get install -y \
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y \
     python3.12 \
     python3.12-venv \
     python3-pip \
@@ -17,22 +14,22 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements and install
+# Install torch cu130 first (bundles CUDA runtime), then the rest of requirements
 COPY requirements.txt .
 RUN python3.12 -m venv venv && \
+    ./venv/bin/pip install --no-cache-dir \
+        torch==2.11.0 \
+        --index-url https://download.pytorch.org/whl/cu130 && \
     ./venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Application code
 COPY . .
 
-# Create assets structure
+# Model cache lives in a volume — create the directory structure
 RUN mkdir -p assets/models/whisper assets/cache
 
-# Expose port
 EXPOSE 5000
 
-# Run the application
 CMD ["./venv/bin/uvicorn", "main_stt:app", "--host", "0.0.0.0", "--port", "5000"]
