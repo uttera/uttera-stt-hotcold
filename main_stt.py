@@ -19,6 +19,13 @@
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.6.3 (2026-04-09): Staggered idle timeouts for cold pool wind-down. Workers
+#   spawned first receive the longest idle timeout (COLD_WORKER_IDLE_TIMEOUT +
+#   COLD_POOL_SIZE * COLD_WORKER_IDLE_STAGGER), workers spawned last receive the
+#   base timeout. Prevents the "cliff death" where all workers die simultaneously
+#   60 s after burst end; instead they wind down one-by-one over a spread of
+#   COLD_POOL_SIZE * COLD_WORKER_IDLE_STAGGER seconds (default: 10 workers × 10 s
+#   = 100 s spread).
 # - 1.6.2 (2026-04-08): Fix VRAM cap in _optimal_cold_workers. The old cap
 #   used int(free_gb/vram_per) as an absolute total, ignoring VRAM already
 #   consumed by running workers — with N active workers it returned N as optimal
@@ -117,7 +124,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.6.2"
+SERVER_VERSION = "1.6.3"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
@@ -146,6 +153,12 @@ COLD_POOL_SIZE = int(os.environ.get("COLD_POOL_SIZE", "10"))
 
 # Seconds of inactivity before an idle pool worker exits on its own.
 COLD_WORKER_IDLE_TIMEOUT = int(os.environ.get("COLD_WORKER_IDLE_TIMEOUT", "60"))
+
+# Additional idle seconds granted per spawn-order position (0-indexed from last).
+# Worker spawned first gets COLD_POOL_SIZE * COLD_WORKER_IDLE_STAGGER extra seconds;
+# worker spawned last gets 0 extra. Staggers pool wind-down so workers die one-by-one
+# instead of all at once 60 s after the burst ends.
+COLD_WORKER_IDLE_STAGGER = int(os.environ.get("COLD_WORKER_IDLE_STAGGER", "10"))
 
 # How often (seconds) the pool manager checks whether to spawn a new cold worker.
 COLD_POOL_MANAGER_INTERVAL = float(os.environ.get("COLD_POOL_MANAGER_INTERVAL", "0.5"))
@@ -551,21 +564,24 @@ async def _hot_worker_loop() -> None:
             _work_queue_audio_seconds -= item.audio_dur
 
 
-async def _pool_worker_loop(worker: _ColdWorker) -> None:
+async def _pool_worker_loop(worker: _ColdWorker, idle_timeout: float = float(COLD_WORKER_IDLE_TIMEOUT)) -> None:
     """
     Persistent asyncio Task for one cold pool worker.
     Consumes _WorkItem entries from the same _work_queue as the hot worker.
     Exits on idle timeout or worker failure; pool manager spawns replacements if needed.
+
+    idle_timeout is set at spawn time (staggered by pool manager) so workers wind down
+    one-by-one after a burst instead of all dying simultaneously.
     """
     global _work_queue_audio_seconds
     try:
         while True:
             try:
                 item = await asyncio.wait_for(
-                    _work_queue.get(), timeout=float(COLD_WORKER_IDLE_TIMEOUT)
+                    _work_queue.get(), timeout=idle_timeout
                 )
             except asyncio.TimeoutError:
-                print(f"--- POOL WORKER: idle timeout ({COLD_WORKER_IDLE_TIMEOUT}s), exiting ---", flush=True)
+                print(f"--- POOL WORKER: idle timeout ({idle_timeout:.0f}s), exiting ---", flush=True)
                 break
             except asyncio.CancelledError:
                 break
@@ -710,11 +726,17 @@ async def _cold_pool_manager() -> None:
         try:
             async with _cold_spawn_lock:
                 worker = await _spawn_cold_worker_with_vram()
-            task = asyncio.create_task(_pool_worker_loop(worker))
+            # Stagger idle timeouts: first spawned → longest, last spawned → COLD_WORKER_IDLE_TIMEOUT.
+            # Ensures workers die one-by-one after a burst rather than simultaneously.
+            n_active = len(_pool_worker_tasks)
+            stagger_extra = max(0, COLD_POOL_SIZE - n_active) * COLD_WORKER_IDLE_STAGGER
+            worker_idle_timeout = float(COLD_WORKER_IDLE_TIMEOUT + stagger_extra)
+            task = asyncio.create_task(_pool_worker_loop(worker, worker_idle_timeout))
             _pool_worker_tasks.add(task)
             task.add_done_callback(_pool_worker_tasks.discard)
             print(
-                f"--- POOL MGR: pool worker ready, total_active={len(_pool_worker_tasks)} ---",
+                f"--- POOL MGR: pool worker ready, total_active={len(_pool_worker_tasks)}"
+                f", idle_timeout={worker_idle_timeout:.0f}s ---",
                 flush=True
             )
         except Exception as e:
