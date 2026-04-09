@@ -6,8 +6,8 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./assets/models:/app/assets/models
-      - ./assets/cache:/app/assets/cache
+      - whisper-models:/app/assets/models
+      - whisper-cache:/app/assets/cache
     environment:
       - WHISPER_MODEL=medium
       - DEBUG=false
@@ -15,3 +15,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     devices:
       - nvidia.com/gpu=all
+
+volumes:
+  whisper-models:
+  whisper-cache:
