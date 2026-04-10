@@ -14,11 +14,14 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.6.0
+# Version: 1.6.4
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.6.4 (2026-04-10): Fix retried items bouncing between cold pool workers.
+#   Cold workers now skip items with retried=True (put back immediately) so only
+#   the hot worker processes them, avoiding unnecessary cold re-attempts.
 # - 1.6.3 (2026-04-09): Staggered idle timeouts for cold pool wind-down. Workers
 #   spawned first receive the longest idle timeout (COLD_WORKER_IDLE_TIMEOUT +
 #   COLD_POOL_SIZE * COLD_WORKER_IDLE_STAGGER), workers spawned last receive the
@@ -585,6 +588,11 @@ async def _pool_worker_loop(worker: _ColdWorker, idle_timeout: float = float(COL
                 break
             except asyncio.CancelledError:
                 break
+
+            # Retried items are reserved for the hot worker — put back and skip.
+            if item.retried:
+                await _work_queue.put(item)
+                continue
 
             item.route = "COLD-POOL"
             requeued = False
