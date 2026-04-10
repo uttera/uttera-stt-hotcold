@@ -14,11 +14,15 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.6.4
+# Version: 1.6.5
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.6.5 (2026-04-10): Align /health schema with coqui-tts-local-server.
+#   Renamed work_queue_depth→queue_depth, work_queue_audio_seconds→queue_audio_seconds,
+#   work_queue_drain_estimate_seconds→queue_drain_estimate_seconds,
+#   cold_workers_in_flight→pool_workers_loading.
 # - 1.6.4 (2026-04-10): Fix retried items bouncing between cold pool workers.
 #   Cold workers now skip items with retried=True (put back immediately) so only
 #   the hot worker processes them, avoiding unnecessary cold re-attempts.
@@ -770,24 +774,23 @@ async def health_check():
     optimal = _optimal_cold_workers()
     drain = round(_work_queue_audio_seconds * _hot_ema_sps, 2) if _hot_ema_sps else None
     routing_stats = {
-        "cold_start_time_seconds": round(_get_cold_start_time_stt(), 2),
+        "ema_sps": round(_hot_ema_sps, 4) if _hot_ema_sps is not None else None,
         "cold_start_calibrated": _cold_ema_start_stt is not None,
         "cold_ema_start_seconds": round(_cold_ema_start_stt, 2) if _cold_ema_start_stt is not None else None,
-        "cold_start_configured_seconds": COLD_START_TIME_SECONDS,
-        "safety_factor": HOT_QUEUE_SAFETY_FACTOR,
-        "ema_sps": round(_hot_ema_sps, 4) if _hot_ema_sps is not None else None,
-        "work_queue_depth": _work_queue.qsize() if _work_queue is not None else 0,
-        "work_queue_audio_seconds": round(_work_queue_audio_seconds, 2),
-        "work_queue_drain_estimate_seconds": drain,
-        "vram_free_gb": round(_free, 2) if _free is not None else None,
-        "min_cold_vram_gb": MIN_COLD_VRAM_GB,
-        "cold_vram_ema_gb": round(_cold_vram_ema_gb, 3) if _cold_vram_ema_gb is not None else None,
-        "cold_vram_per_worker_gb": round(_vram_per_cold_worker(), 3),
-        "cold_workers_in_flight": _cold_workers_in_flight,
+        "queue_depth": _work_queue.qsize() if _work_queue is not None else 0,
+        "queue_audio_seconds": round(_work_queue_audio_seconds, 2),
+        "queue_drain_estimate_seconds": drain,
         "pool_workers_active": len(_pool_worker_tasks),
+        "pool_workers_loading": _cold_workers_in_flight,
         "pool_workers_optimal": optimal,
         "pool_size_cap": COLD_POOL_SIZE,
+        "vram_free_gb": round(_free, 2) if _free is not None else None,
+        "cold_vram_ema_gb": round(_cold_vram_ema_gb, 3) if _cold_vram_ema_gb is not None else None,
         "vram_sufficient_for_cold": _has_vram_for_cold_lane(),
+        "cold_start_configured_seconds": COLD_START_TIME_SECONDS,
+        "safety_factor": HOT_QUEUE_SAFETY_FACTOR,
+        "min_cold_vram_gb": MIN_COLD_VRAM_GB,
+        "cold_vram_per_worker_gb": round(_vram_per_cold_worker(), 3),
     }
     return {
         "status": "ok",
