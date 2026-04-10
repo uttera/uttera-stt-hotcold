@@ -14,11 +14,15 @@
 # GNU General Public License for more details.
 #
 # Package: whisper-stt-server
-# Version: 1.6.5
+# Version: 1.6.6
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 1.6.6 (2026-04-10): Add routing.load_score and routing.accepts_requests to
+#   /health for front-end router support. load_score is drain_estimate/cap (0–1),
+#   accepts_requests is False when model not loaded, errored, or score=1.0.
+#   ROUTING_DRAIN_CAP_SECONDS env var (default 120) controls saturation threshold.
 # - 1.6.5 (2026-04-10): Align /health schema with coqui-tts-local-server.
 #   Renamed work_queue_depth→queue_depth, work_queue_audio_seconds→queue_audio_seconds,
 #   work_queue_drain_estimate_seconds→queue_drain_estimate_seconds,
@@ -181,6 +185,11 @@ WHISPER_FP16 = os.environ.get("WHISPER_FP16", "1").lower() in ("1", "true", "yes
 COLD_LANE_TIMEOUT_SECONDS = int(os.environ.get("COLD_LANE_TIMEOUT_SECONDS", "300"))
 
 MIN_COLD_VRAM_GB = float(os.environ.get("MIN_COLD_VRAM_GB", 4.0))
+
+# Drain time (seconds) considered 100% load for routing score. Requests with a
+# drain estimate at or above this cap receive load_score=1.0 and the node is
+# excluded from routing until the queue clears.
+ROUTING_DRAIN_CAP_SECONDS = float(os.environ.get("ROUTING_DRAIN_CAP_SECONDS", "120"))
 
 COLD_START_TIME_SECONDS = float(os.environ.get("COLD_START_TIME_SECONDS", 8.0))
 
@@ -773,6 +782,12 @@ async def health_check():
     _free = _free_vram_gb()
     optimal = _optimal_cold_workers()
     drain = round(_work_queue_audio_seconds * _hot_ema_sps, 2) if _hot_ema_sps else None
+    if drain is not None:
+        load_score = round(min(drain / ROUTING_DRAIN_CAP_SECONDS, 1.0), 3)
+    else:
+        # Not yet calibrated — use audio seconds as rough proxy (120s queued ≈ saturated)
+        load_score = round(min(_work_queue_audio_seconds / ROUTING_DRAIN_CAP_SECONDS, 1.0), 3)
+    accepts = whisper_model is not None and hot_worker_error is None and load_score < 1.0
     routing_stats = {
         "ema_sps": round(_hot_ema_sps, 4) if _hot_ema_sps is not None else None,
         "cold_start_calibrated": _cold_ema_start_stt is not None,
@@ -798,6 +813,10 @@ async def health_check():
         "model": model_name,
         "hot_worker_loaded": whisper_model is not None,
         "hot_worker_error": hot_worker_error,
+        "routing": {
+            "load_score": load_score,
+            "accepts_requests": accepts,
+        },
         "smart_routing": routing_stats,
     }
 
