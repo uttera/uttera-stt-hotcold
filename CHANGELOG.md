@@ -5,6 +5,99 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.7] - 2026-04-10
+
+### Added
+- **Redis self-registration:** Each tick of `_cold_pool_manager` publishes
+  `{load_score, accepts_requests, host, port, version, ts}` to `stt:nodes:{NODE_ID}`
+  with TTL = 3 × pool manager interval. Opt-in via `REDIS_URL` env var; silently disabled
+  if unset or unreachable. Key deleted on clean shutdown. Adds `redis[asyncio]>=5.0.0`
+  to requirements.
+
+### Changed
+- **Dependency pins:** `torch>=2.9.0,<2.10.0`, `torchaudio>=2.9.0,<2.10.0` added to
+  `requirements.txt`. Torch 2.10+ switches torchaudio to a torchcodec-only backend
+  requiring CUDA 13 NPP libraries not yet widely available on systems with CUDA 12 toolkit.
+
+## [1.6.6] - 2026-04-10
+
+### Added
+- **Routing fields in `/health`:** `routing.load_score` (0–1, based on queue drain estimate
+  divided by `ROUTING_DRAIN_CAP_SECONDS`, default 120) and `routing.accepts_requests`
+  (false when model not loaded, errored, or score = 1.0). Designed for front-end router
+  (OpenResty Gatekeeper) node selection.
+
+## [1.6.5] - 2026-04-10
+
+### Changed
+- **`/health` schema aligned with coqui-tts-local-server.** Renamed:
+  `work_queue_depth` → `queue_depth`, `work_queue_audio_seconds` → `queue_audio_seconds`,
+  `work_queue_drain_estimate_seconds` → `queue_drain_estimate_seconds`,
+  `cold_workers_in_flight` → `pool_workers_loading`.
+
+## [1.6.4] - 2026-04-10
+
+### Fixed
+- **Retried-item routing loop:** Cold pool workers now skip items with `retried=True`
+  (put back on queue immediately) so only the hot worker processes them, avoiding
+  unnecessary cold re-attempts that waste worker time and delay delivery.
+
+## [1.6.3] - 2026-04-09
+
+### Added
+- **Staggered idle timeouts for cold pool wind-down.** Workers spawned first receive the
+  longest idle timeout (`COLD_WORKER_IDLE_TIMEOUT + COLD_POOL_SIZE * COLD_WORKER_IDLE_STAGGER`),
+  workers spawned last receive the base timeout. Prevents the "cliff death" where all workers
+  die simultaneously after a burst; instead they wind down one-by-one over a spread of
+  `COLD_POOL_SIZE * COLD_WORKER_IDLE_STAGGER` seconds.
+
+## [1.6.2] - 2026-04-08
+
+### Fixed
+- **VRAM cap in `_optimal_cold_workers`:** The old cap used `int(free_gb/vram_per)` as an
+  absolute total, ignoring VRAM already consumed by running workers — with N active workers
+  it returned N as optimal and the manager never spawned more. Removed: VRAM gating is
+  handled solely by `_has_vram_for_cold_lane()` in the pool manager (single source of truth).
+
+## [1.6.1] - 2026-04-08
+
+### Added
+- **Cold pool worker crash fallback to hot lane.** On any pool worker failure (OOM, kill, crash),
+  the `WorkItem` is re-queued so the hot worker rescues it instead of returning HTTP 500.
+  `X-Route` reports `COLD-POOL>HOT`. Validated with `COLD_CRASH_TEST=1`: 40/40 OK.
+
+## [1.6.0] - 2026-04-08
+
+### Changed
+- **Shared work queue + dynamic pool sizing.** All requests (hot and cold) are dispatched
+  through a single `asyncio.Queue`. The hot worker and all pool workers consume from this
+  queue, so cold workers spawned mid-burst serve requests queued before they finished loading.
+- Pool size computed dynamically each tick using `N*(N-1) < 2*queue_work_s/cold_ema`.
+  `COLD_POOL_SIZE` becomes a safety cap (default 10).
+- Branches A/B/C/D replaced by a single enqueue path. `X-Route` reports `HOT` or `COLD-POOL`.
+
+## [1.5.3] - 2026-04-08
+
+### Added
+- **Cold pool manager.** Background asyncio task monitors hot lane queue drain every 0.5s and
+  spawns cold workers proactively when drain exceeds threshold. The router no longer spawns
+  workers directly. Spawning is serial via `_cold_spawn_lock` to avoid CUDA contention.
+
+## [1.5.2] - 2026-04-08
+
+### Added
+- **Serial cold spawning via `_cold_spawn_lock`.** If another worker is already loading,
+  the request goes to HOT-C instead of spawning a concurrent loader, preventing CUDA
+  contention between simultaneous cold workers.
+
+## [1.5.1] - 2026-04-08
+
+### Added
+- **Cold EMA startup warmup + unified inference EMA.** At startup, a cold worker is spawned,
+  a silence clip is transcribed to measure cold start time, `cold_ema` is seeded, VRAM drop
+  measured, then the worker is killed. `_cold_inference_ema_stt` removed: once loaded,
+  inference time equals hot lane time, so `_hot_ema_sps` is the correct estimator.
+
 ## [1.5.0] - 2026-04-08
 
 ### Added
