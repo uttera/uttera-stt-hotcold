@@ -1,23 +1,17 @@
 #!/bin/bash
 # Uttera STT Unified Setup Script
-# Version: 1.0.0
-# Description: Orchestrates Python environment setup. Uses Python 3.12 for dependency
-#              compatibility. Falls back to python3 if python3.12 is not found.
+# Version: 1.6.7
+# Description: Orchestrates Python environment setup and asset provisioning.
 
 set -e
 
-echo "🦾 Uttera - Starting STT Installation Protocol..."
+echo "Whisper STT Server — Starting Installation..."
 
 # 1. Python Virtual Environment
-# Python 3.12 is preferred for wheel availability with torch/openai-whisper.
+# Uses system default python3 (3.12+ recommended).
 echo "[*] Initializing Python Virtual Environment..."
-if command -v python3.12 &>/dev/null; then
-    PYTHON_BIN=python3.12
-    echo "    -> Using python3.12"
-else
-    PYTHON_BIN=python3
-    echo "    [!] python3.12 not found, falling back to $(python3 --version). Some dependencies may fail."
-fi
+PYTHON_BIN=python3
+echo "    -> Using $($PYTHON_BIN --version)"
 $PYTHON_BIN -m venv venv
 source venv/bin/activate
 
@@ -39,4 +33,4 @@ else
     exit 1
 fi
 
-echo "✅ All systems operational."
+echo "All systems operational."

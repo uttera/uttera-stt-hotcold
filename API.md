@@ -59,10 +59,30 @@ Returns server liveness and hot worker status. Suitable for monitoring and healt
 ```json
 {
   "status": "ok",
-  "version": "1.3.6",
+  "version": "1.6.7",
   "model": "medium",
+  "fp16": true,
   "hot_worker_loaded": true,
-  "hot_worker_error": null
+  "hot_worker_error": null,
+  "routing": {
+    "load_score": 0.0,
+    "accepts_requests": true
+  },
+  "smart_routing": {
+    "ema_sps": 12.5,
+    "cold_start_calibrated": true,
+    "cold_ema_start_seconds": 8.2,
+    "queue_depth": 0,
+    "queue_audio_seconds": 0.0,
+    "queue_drain_estimate_seconds": 0.0,
+    "pool_workers_active": 0,
+    "pool_workers_loading": 0,
+    "pool_workers_optimal": 0,
+    "pool_size_cap": 10,
+    "vram_free_gb": 28.5,
+    "cold_vram_ema_gb": 1.8,
+    "vram_sufficient_for_cold": true
+  }
 }
 ```
 

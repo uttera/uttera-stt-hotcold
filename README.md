@@ -25,10 +25,10 @@ High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architec
 ### 1. Prerequisites (Debian/Ubuntu)
 Install the following system dependencies first:
 ```bash
-sudo apt update && sudo apt install -y ffmpeg python3.12 python3.12-venv
+sudo apt update && sudo apt install -y ffmpeg python3 python3-venv
 ```
 
-> **Python version:** `setup.sh` prefers **Python 3.12**. On systems where Python 3.12 is not the default (e.g. Ubuntu 24.10 with Python 3.14), the package above installs it alongside the system Python. The script falls back to `python3` with a warning if 3.12 is not found.
+> **Python version:** `setup.sh` uses the system default `python3` (3.12+ recommended). torch is pinned to `>=2.9.0,<2.10.0` to avoid CUDA 13 NPP dependency issues with newer versions.
 
 ### 2. Unified Installation
 ```bash
@@ -82,11 +82,20 @@ Copy `.env.example` to `.env` and adjust as needed. All variables are optional.
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `WHISPER_MODEL` | `medium` | Model to load: `tiny`, `base`, `small`, `medium`, `large`. |
+| `WHISPER_FP16` | `1` | fp16+LayerNorm-fp32 (halves VRAM). Set to `0` for fp32. |
+| `COLD_POOL_SIZE` | `10` | Max concurrent cold workers (safety cap). |
+| `COLD_WORKER_IDLE_TIMEOUT` | `60` | Seconds before idle cold worker exits. |
+| `COLD_WORKER_IDLE_STAGGER` | `10` | Stagger per worker slot to avoid mass die-off. |
+| `MIN_COLD_VRAM_GB` | `4.0` | Min free VRAM to spawn a cold worker (0=disable). |
 | `COLD_LANE_TIMEOUT_SECONDS` | `300` | Max seconds to wait for a Cold Lane subprocess before HTTP 500. |
-| `XDG_CACHE_HOME` | `assets/models` | Override model cache directory (e.g. for shared installs). |
-| `VENV_PYTHON` | *(auto-detected)* | Path to venv Python. Auto-detected from `venv/bin/python`. |
-| `WHISPER_SCRIPT` | *(auto-detected)* | Path to whisper CLI. Auto-detected from `venv/bin/whisper`. |
+| `ROUTING_DRAIN_CAP_SECONDS` | `120` | Queue drain time considered 100% load. |
+| `REDIS_URL` | *(empty)* | Redis URL for node self-registration (opt-in). |
+| `NODE_HOST` | `localhost` | Host advertised to Redis for Gatekeeper routing. |
+| `NODE_PORT` | `5000` | Port advertised to Redis for Gatekeeper routing. |
 | `DEBUG` | `false` | Set to `true` to enable worker routing and subprocess traces. |
+| `VENV_PYTHON` | *(auto-detected)* | Path to venv Python. Auto-detected from `venv/bin/python`. |
+
+*See `.env.example` for the full list of variables and their defaults.*
 
 ### User Service (systemd --user)
 1. Create directory if it doesn't exist: `mkdir -p ~/.config/systemd/user`
@@ -206,12 +215,13 @@ By default, the server binds to **`127.0.0.1`** on port **`5000`**.
 - To allow external network access, change `--host` to `0.0.0.0`.
 - **WARNING**: This API **does not have authentication**. Exposing it to the network via `0.0.0.0` represents a security risk. Ensure the server is protected by a firewall or operating within a secure VPN/local network.
 
-## 📊 Performance Benchmarks (NVIDIA RTX 5090)
+## 📊 Performance (NVIDIA RTX 5090, fp16, medium model)
 
-| Task | Hot Lane | Cold Lane |
-| :--- | :--- | :--- |
-| Short command (2s audio) | **~0.2s** | ~3s |
-| Long audio (30s) | **~0.7s** | ~5s |
+| Task | Latency |
+| :--- | :--- |
+| Short command (2s audio, Hot Lane) | **~0.2s** |
+| Long audio (30s, Hot Lane) | **~0.7s** |
+| 160 concurrent (Hot + Cold Pool) | Target ~21s total, 0 failures |
 
 ## 🛡 License
 
