@@ -20,6 +20,37 @@ High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architec
 - **Health Endpoint:** `GET /health` exposes server version, model name, and hot worker status for proxies and Docker healthchecks.
 - **Privacy First:** 100% local execution. Your audio never leaves your infrastructure.
 
+## 🧠 Available Models
+
+| Model | Params | VRAM (fp16) | Speed | Languages | Best for |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `tiny` | 39M | ~1 GB | Fastest | 99 | Testing, low-resource |
+| `tiny.en` | 39M | ~1 GB | Fastest | English only | English-only, low-resource |
+| `base` | 74M | ~1 GB | Fast | 99 | Light workloads |
+| `base.en` | 74M | ~1 GB | Fast | English only | Light English-only |
+| `small` | 244M | ~2 GB | Moderate | 99 | Good accuracy/speed balance |
+| `small.en` | 244M | ~2 GB | Moderate | English only | English-only balanced |
+| `medium` | 769M | ~5 GB | Slow | 99 | **Default.** High accuracy |
+| `medium.en` | 769M | ~5 GB | Slow | English only | English-only high accuracy |
+| `large` | 1550M | ~10 GB | Slowest | 99 | Maximum accuracy (v1) |
+| `large-v2` | 1550M | ~10 GB | Slowest | 99 | Improved large |
+| `large-v3` | 1550M | ~10 GB | Slowest | 99 | Best accuracy overall |
+| `turbo` | 809M | ~6 GB | Fast | 99 | **Recommended.** large-v3 distilled, best quality/speed |
+
+Set the model via `WHISPER_MODEL` in `.env`. To download all models at once for offline use:
+
+```bash
+source venv/bin/activate
+python3 -c "
+import whisper
+for m in ['tiny','tiny.en','base','base.en','small','small.en',
+          'medium','medium.en','large','large-v2','large-v3','turbo']:
+    print(f'Downloading {m}...')
+    whisper.load_model(m, download_root='assets/models/whisper')
+    print(f'  Done: {m}')
+"
+```
+
 ## 📦 Installation & Setup
 
 ### 1. Prerequisites (Debian/Ubuntu)
