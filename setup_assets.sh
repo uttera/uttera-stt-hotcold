@@ -31,18 +31,19 @@ else
 fi
 
 # 5. Model Provisioning (Idempotent)
-# Downloads the default model (medium) by triggering a dummy transcription.
-# Whisper downloads on first use; subsequent runs are instant.
-echo "[*] Provisioning Whisper model (medium)..."
-MODEL_NAME="${WHISPER_MODEL:-medium}"
+# Downloads all available Whisper models for offline use.
+# Subsequent runs are instant (skips already-downloaded models).
+echo "[*] Provisioning all Whisper models..."
 
 $PYTHON_BIN - <<EOF
 import whisper, os
 cache = os.path.join("$MODELS_DIR", "whisper")
-model = "$MODEL_NAME"
-print(f"    -> Downloading/verifying model '{model}' to {cache}...")
-whisper.load_model(model, download_root=cache)
-print("    [✓] Model ready.")
+models = ["tiny", "tiny.en", "base", "base.en", "small", "small.en",
+          "medium", "medium.en", "large", "large-v2", "large-v3", "turbo"]
+for m in models:
+    print(f"    -> Downloading/verifying '{m}'...")
+    whisper.load_model(m, download_root=cache)
+    print(f"    [✓] {m} ready.")
 EOF
 
 echo "✅ STT Asset Provisioning Complete."
