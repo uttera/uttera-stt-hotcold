@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025-2026 Hugo L. Espuny
+#
+# Part of the Uttera voice stack (https://uttera.ai).
+# See LICENSE and NOTICE at the repository root.
 """
 cold_worker.py — Persistent Whisper subprocess for the cold worker pool.
 

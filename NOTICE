@@ -1,0 +1,76 @@
+uttera-stt-hotcold (whisper-stt-local-server)
+Copyright 2025-2026 Hugo L. Espuny
+
+Created and originally developed by Hugo L. Espuny <https://github.com/fakehec>.
+Part of the Uttera voice stack <https://uttera.ai>.
+
+Licensed under the Apache License, Version 2.0. See LICENSE for details.
+
+================================================================================
+Third-party software and models used by this project
+================================================================================
+
+This product includes software and models developed by third parties. Their
+licenses apply to the respective components.
+
+--------------------------------------------------------------------------------
+Whisper (OpenAI)
+  Source:   https://github.com/openai/whisper
+  License:  MIT
+  URL:      https://github.com/openai/whisper/blob/main/LICENSE
+
+  The Whisper model family (tiny, base, small, medium, large, large-v2,
+  large-v3, large-v3-turbo) is released by OpenAI under the MIT License.
+  Both the reference implementation and the model weights are MIT-licensed,
+  which permits commercial use without restriction.
+
+--------------------------------------------------------------------------------
+faster-whisper
+  Source:   https://github.com/SYSTRAN/faster-whisper
+  License:  MIT
+  URL:      https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE
+
+  High-performance Whisper inference runtime used by this server. Built on
+  top of CTranslate2.
+
+--------------------------------------------------------------------------------
+CTranslate2
+  Source:   https://github.com/OpenNMT/CTranslate2
+  License:  MIT
+  URL:      https://github.com/OpenNMT/CTranslate2/blob/master/LICENSE
+
+  Transformer inference engine used transitively via faster-whisper.
+
+--------------------------------------------------------------------------------
+PyTorch
+  Source:   https://github.com/pytorch/pytorch
+  License:  BSD 3-Clause
+  URL:      https://github.com/pytorch/pytorch/blob/main/LICENSE
+
+  Used as a runtime dependency for some configurations.
+
+--------------------------------------------------------------------------------
+FastAPI
+  Source:   https://github.com/fastapi/fastapi
+  License:  MIT
+
+  HTTP framework used by this server.
+
+--------------------------------------------------------------------------------
+Uvicorn
+  Source:   https://github.com/encode/uvicorn
+  License:  BSD 3-Clause
+
+  ASGI server used to run this service.
+
+--------------------------------------------------------------------------------
+redis-py (optional, used when REDIS_URL is set)
+  Source:   https://github.com/redis/redis-py
+  License:  MIT
+
+  Used for optional cluster self-registration.
+
+--------------------------------------------------------------------------------
+Additional transitive dependencies
+  A full list of transitive dependencies and their licenses can be generated
+  with `pip-licenses` or `pipdeptree` after installation.
