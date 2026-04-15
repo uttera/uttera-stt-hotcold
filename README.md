@@ -13,12 +13,20 @@ High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architec
 > Licensed under the [Apache License 2.0](LICENSE).
 > See [NOTICE](NOTICE) for third-party attributions.
 
-## 📢 Heads-up: this project is being renamed
+## 📢 Project history: renamed and transferred
 
-This repository will soon be renamed to **`uttera-stt-hotcold`** and
-transferred to the [Uttera GitHub organization](https://github.com/uttera).
-GitHub will automatically redirect the old URL, so any existing clones,
-forks, and links will continue to work.
+This repository has been **renamed** from `whisper-stt-local-server` to
+**`uttera-stt-hotcold`** and **transferred** from its original creator's
+personal page ([@fakehec](https://github.com/fakehec)) to the
+[Uttera GitHub organization](https://github.com/uttera).
+
+GitHub redirects old URLs automatically, so any existing clones, forks,
+bookmarks, and links keep working. If you still have
+`fakehec/whisper-stt-local-server` as your `origin`, consider updating:
+
+```bash
+git remote set-url origin https://github.com/uttera/uttera-stt-hotcold.git
+```
 
 ## 🚀 Key Features
 
@@ -75,8 +83,8 @@ sudo apt update && sudo apt install -y ffmpeg python3 python3-venv
 
 ### 2. Unified Installation
 ```bash
-git clone https://github.com/fakehec/whisper-stt-local-server.git
-cd whisper-stt-local-server
+git clone https://github.com/uttera/uttera-stt-hotcold.git
+cd uttera-stt-hotcold
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -142,18 +150,18 @@ Copy `.env.example` to `.env` and adjust as needed. All variables are optional.
 
 ### User Service (systemd --user)
 1. Create directory if it doesn't exist: `mkdir -p ~/.config/systemd/user`
-2. Create: `~/.config/systemd/user/whisper-stt.service`
+2. Create: `~/.config/systemd/user/uttera-stt.service`
 3. Configuration (environment variables are loaded from your `.env` file):
 
 ```ini
 [Unit]
-Description=Whisper STT Local Server
+Description=Uttera STT Hot/Cold Server
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/whisper-stt-local-server
-ExecStart=%h/whisper-stt-local-server/venv/bin/uvicorn main_stt:app --host 127.0.0.1 --port 5000
+WorkingDirectory=%h/uttera-stt-hotcold
+ExecStart=%h/uttera-stt-hotcold/venv/bin/uvicorn main_stt:app --host 127.0.0.1 --port 5000
 Restart=always
 RestartSec=5
 
@@ -164,7 +172,7 @@ WantedBy=default.target
 4. Enable and start:
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now whisper-stt.service
+systemctl --user enable --now uttera-stt.service
 ```
 
 ## 🔧 Troubleshooting

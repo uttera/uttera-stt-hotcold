@@ -1,0 +1,11 @@
+name: "Uttera STT (Hot/Cold)"
+website_url: "https://github.com/uttera/uttera-stt-hotcold"
+source_code_url: "https://github.com/uttera/uttera-stt-hotcold"
+description: "High-performance STT API server with a hybrid Hot/Cold worker architecture for ultra-low latency inference. Part of the Uttera voice stack. faster-whisper backend."
+licenses:
+  - Apache-2.0
+platforms:
+  - Python
+  - Docker
+tags:
+  - Generative Artificial Intelligence (GenAI)
