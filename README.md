@@ -1,12 +1,24 @@
 # whisper-stt-local-server
 
 <p align="center">
-  <img src="docs/img/social-preview.jpg" alt="Whisper STT Local Server" width="800">
+  <img src="docs/img/banner.png" alt="uttera.ai — The voice layer for your AI" width="800">
 </p>
 
 High-performance Whisper STT API server with a hybrid "Hot/Cold" worker architecture.
 
 **Ideal for locally running installations of agents like OpenClaw or Open-WebUI, where the media should not leave the private local domain.**
+
+> **Created and maintained by [Hugo L. Espuny](https://github.com/fakehec).**
+> Part of the [Uttera](https://uttera.ai) voice stack.
+> Licensed under the [Apache License 2.0](LICENSE).
+> See [NOTICE](NOTICE) for third-party attributions.
+
+## 📢 Heads-up: this project is being renamed
+
+This repository will soon be renamed to **`uttera-stt-hotcold`** and
+transferred to the [Uttera GitHub organization](https://github.com/uttera).
+GitHub will automatically redirect the old URL, so any existing clones,
+forks, and links will continue to work.
 
 ## 🚀 Key Features
 
