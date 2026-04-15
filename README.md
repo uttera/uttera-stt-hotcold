@@ -1,4 +1,4 @@
-# whisper-stt-local-server
+# uttera-stt-hotcold
 
 <p align="center">
   <img src="docs/img/banner.png" alt="uttera.ai — The voice layer for your AI" width="800">
@@ -268,14 +268,25 @@ By default, the server binds to **`127.0.0.1`** on port **`5000`**.
 
 ## 🛡 License
 
-GNU GPL v3. Maintainers: Hugo L. Espuny & Uttera
+**Server source code**: [Apache License 2.0](LICENSE). Commercial use permitted.
 
-## ☕ Support
+**Whisper model weights** (OpenAI): released under the MIT License —
+commercial use permitted, no restrictions. See [NOTICE](NOTICE) for full
+attributions.
 
-If this project is useful to you, consider supporting its development:
+Created and maintained by [Hugo L. Espuny](https://github.com/fakehec),
+with contributions acknowledged in [AUTHORS.md](AUTHORS.md).
 
-- **Bitcoin (BTC):** `38jJyMomtUqhCjuNJ9VxKpgEyMyx37Zqix`
-- **Monero (XMR):** `82bbUZdkMXUPAma4ioTuZNcJgTh8YTv4XNUwPy6T28kYJWCfeGgV79AZb7amCszFXeBaa5u595cQBVjFS4PkBGim56ap7Ej`
+## ☕ Community
+
+If you want to follow the project or get involved:
+
+- ⭐ Star this repo to help discoverability.
+- 🐛 Report issues via the [issue tracker](../../issues).
+- 💬 Join the conversation in [Discussions](../../discussions).
+- 📰 Technical posts at [blog.uttera.ai](https://blog.uttera.ai).
+- 🌐 Uttera Cloud: [https://uttera.ai](https://uttera.ai) (EU-hosted,
+  solar-powered, subscription flat-rate).
 
 ---
 
