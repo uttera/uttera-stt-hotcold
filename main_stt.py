@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# Whisper STT Server (Hybrid Model)
+# Uttera STT Server (Hybrid Model)
 #
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026 Hugo L. Espuny
@@ -10,12 +10,33 @@
 # Part of the Uttera voice stack (https://uttera.ai).
 # See LICENSE and NOTICE for full terms and attributions.
 #
-# Package: whisper-stt-server
-# Version: 1.6.7
+# Package: uttera-stt-hotcold
+# Version: 2.0.0
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 2.0.0 (2026-04-16): First Uttera-branded release. BREAKING:
+#   * Rebranded from "Whisper STT Server" to Uttera. Repository moved to
+#     github.com/uttera/uttera-stt-hotcold. README, banner, docs, systemd
+#     unit names, FastAPI app title ("Uttera STT Server"), Dockerfile
+#     and compose all updated. Personal donation addresses and Stark
+#     Fleet artifacts removed.
+#   * License changed to Apache-2.0. OpenAI Whisper weights remain under
+#     their upstream MIT license.
+#   Changed:
+#   * SERVER_VERSION re-synced to 2.0.0 — the constant had been stuck at
+#     "1.6.3" since v1.6.3, reporting a stale version in /health,
+#     /v1/models, and the FastAPI metadata despite inline changelog
+#     moves through v1.6.4/v1.6.5/v1.6.6/v1.6.7.
+#   Added:
+#   * setup_assets.sh now downloads every Whisper model by default
+#     (tiny/tiny.en/base/base.en/small/small.en/medium/medium.en/large/
+#     large-v2/large-v3/turbo), so swapping via WHISPER_MODEL env var
+#     works fully offline. Idempotent — skips already-cached models.
+#   * OSS community files: HISTORY.md, AUTHORS.md, CODE_OF_CONDUCT.md,
+#     SECURITY.md, CODEOWNERS, CONTRIBUTING updates, etymology/backronym
+#     section in the README.
 # - 1.6.7 (2026-04-10): Redis self-registration. Each tick of _cold_pool_manager
 #   publishes {load_score, accepts_requests, host, port, version, ts} to
 #   stt:nodes:{NODE_ID} with TTL=3×interval. Opt-in via REDIS_URL env var;
@@ -138,7 +159,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "1.6.3"
+SERVER_VERSION = "2.0.0"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
@@ -267,7 +288,7 @@ async def _lifespan(application: FastAPI):
         await _redis.aclose()
 
 
-app = FastAPI(title="Whisper STT Server", version=SERVER_VERSION, lifespan=_lifespan)
+app = FastAPI(title="Uttera STT Server", version=SERVER_VERSION, lifespan=_lifespan)
 
 # -------------------------------
 # 2. Model Loading

@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-04-16
+
+First Uttera-branded release. Rebrand from "Whisper STT Server" to
+"Uttera STT", relicensed to Apache-2.0, offline-first setup, and a
+long-overdue `SERVER_VERSION` re-sync.
+
+### BREAKING
+- **Project rebranded to Uttera.** Repository moved to
+  `https://github.com/uttera/uttera-stt-hotcold`. README, banner, docs,
+  and FastAPI app title updated to "Uttera STT Server". Legacy clone
+  URLs, systemd unit names, and Uttera / personal-donation artifacts
+  removed.
+- **License changed to Apache-2.0** (was unlicensed / proprietary in
+  earlier releases). See `LICENSE` and `NOTICE`. The OpenAI Whisper
+  weights remain under their upstream MIT license.
+
+### Changed
+- **`SERVER_VERSION` re-synced to `2.0.0`.** The constant had been stuck
+  at `1.6.3` since v1.6.3, reporting an outdated version in `/health`,
+  `/v1/models`, and the FastAPI app metadata — even after the inline
+  changelog had moved through v1.6.4 / v1.6.5 / v1.6.6 / v1.6.7. Now
+  tracks the release tag.
+- **FastAPI app title:** `"Whisper STT Server"` → `"Uttera STT Server"`.
+- Rebranded README, banner, API.md, `setup.sh`, Dockerfile, and
+  `docker-compose.yml` to Uttera. Added `HISTORY.md`, `AUTHORS.md`,
+  `CODE_OF_CONDUCT.md`, `SECURITY.md`, `CODEOWNERS`, and the
+  contributing / community files to match the Uttera house style.
+- README post-transfer tone fixed (past-tense narration, new clone URL,
+  new systemd unit names), etymology and backronym for "Uttera"
+  documented, banner tagline aligned with the rest of the stack ("The
+  voice layer for your AI").
+- Removed personal donation addresses from the README.
+
+### Added
+- **`setup_assets.sh` now downloads all Whisper models by default**
+  (`tiny`, `tiny.en`, `base`, `base.en`, `small`, `small.en`, `medium`,
+  `medium.en`, `large`, `large-v2`, `large-v3`, `turbo`). Previously
+  only the one selected by `WHISPER_MODEL` (default `medium`) was
+  fetched, forcing a network round-trip the first time a different
+  model was requested at runtime. Assets are idempotent — already-cached
+  models are skipped. Enables fully offline switching via the
+  `WHISPER_MODEL` env var.
+- README now lists the available models and documents the bulk-download
+  command so operators can preload a fleet in a single step.
+
 ## [1.6.7] - 2026-04-10
 
 ### Added
