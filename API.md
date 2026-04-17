@@ -32,7 +32,16 @@ Transcribes audio to text in the original language.
 
 ### `POST /v1/audio/translations`
 
-Transcribes audio in any language and translates it to English in a single pass.
+Transcribes audio in any language and translates it to a target language.
+
+- **When `LIBRETRANSLATE_URL` is configured** (recommended): Whisper
+  transcribes the audio in the source language (auto-detected or forced
+  via the `language` form field), then the text is sent to LibreTranslate
+  to reach `to_language` (default `en`). Supports arbitrary target
+  languages.
+- **When `LIBRETRANSLATE_URL` is empty** (legacy fallback): Whisper native
+  `translate` task. English-only. Works poorly on models that were not
+  trained for this task (e.g. `whisper-large-v3-turbo`).
 
 #### Headers
 - `Content-Type: multipart/form-data`
@@ -46,6 +55,14 @@ Transcribes audio in any language and translates it to English in a single pass.
 | `prompt` | String | `null` | Optional guide for the model. |
 | `response_format`| String | `json` | Output format: `json` or `text`. |
 | `temperature` | Float | `0.0` | Controls randomness. |
+| `to_language` | String | `en` | **(LibreTranslate path only)** ISO-639-1 target (`en`, `es`, `fr`, `de`, …). |
+| `language` | String | `null` | Optional **source** language hint for Whisper; omit for auto-detect. |
+
+#### Errors (LibreTranslate path)
+
+| HTTP | When |
+|---|---|
+| 502 | LibreTranslate call failed (network, HTTP error, or malformed response). The endpoint does **not** silently fall back to the untranslated transcription, because that would leak source-language text under a response schema that promises the target language. |
 
 ---
 

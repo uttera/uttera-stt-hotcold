@@ -11,11 +11,24 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-hotcold
-# Version: 2.0.0
+# Version: 2.1.0
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 2.1.0 (2026-04-17): /v1/audio/translations now works via a
+#   Whisper-transcribe → LibreTranslate post-processing pipeline when
+#   the new LIBRETRANSLATE_URL env var is set. Supports arbitrary
+#   target languages via the `to_language` form field (default "en"
+#   for OpenAI-compatibility), not only English. When source ==
+#   target, LibreTranslate is skipped. When LibreTranslate fails,
+#   the endpoint returns HTTP 502 (no silent fallback to untranslated
+#   text). If LIBRETRANSLATE_URL is unset, falls back to the legacy
+#   Whisper-native translate task for backward compatibility. New
+#   env vars: LIBRETRANSLATE_URL, LIBRETRANSLATE_API_KEY,
+#   LIBRETRANSLATE_TIMEOUT_S. New request form field: `to_language`
+#   (optional) and explicit `language` (source hint). Requirements
+#   gained httpx>=0.27.0.
 # - 2.0.0 (2026-04-16): First Uttera-branded release. BREAKING:
 #   * Rebranded from "Whisper STT Server" to Uttera. Repository moved to
 #     github.com/uttera/uttera-stt-hotcold. README, banner, docs, systemd
@@ -159,7 +172,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = "2.1.0"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
@@ -214,6 +227,18 @@ MIN_COLD_VRAM_GB = float(os.environ.get("MIN_COLD_VRAM_GB", 4.0))
 # drain estimate at or above this cap receive load_score=1.0 and the node is
 # excluded from routing until the queue clears.
 ROUTING_DRAIN_CAP_SECONDS = float(os.environ.get("ROUTING_DRAIN_CAP_SECONDS", "120"))
+
+# LibreTranslate post-processing for /v1/audio/translations.
+# When this URL is set, /v1/audio/translations first transcribes with Whisper
+# (in whatever source language is detected) and then passes the text through
+# LibreTranslate to reach the requested `to_language`. Enables targets other
+# than English (which Whisper's native translate is limited to) and works
+# even with models that handle the native `translate` task poorly.
+# If LIBRETRANSLATE_URL is empty, /v1/audio/translations falls back to the
+# legacy Whisper-native translate path.
+LIBRETRANSLATE_URL = os.environ.get("LIBRETRANSLATE_URL", "").rstrip("/")
+LIBRETRANSLATE_API_KEY = os.environ.get("LIBRETRANSLATE_API_KEY", "")
+LIBRETRANSLATE_TIMEOUT_S = float(os.environ.get("LIBRETRANSLATE_TIMEOUT_S", "30"))
 
 # Redis self-registration (opt-in). If REDIS_URL is unset, publishing is skipped.
 # NODE_ID defaults to HOST:PORT. TTL is set to 3× the pool manager interval so
@@ -936,16 +961,67 @@ async def create_transcription(
     finally:
         await file.close()
 
+# Whisper emits ISO-639-1 language codes (e.g. "zh"); LibreTranslate
+# expects different codes for a few Asian languages. Map at the boundary.
+_WHISPER_TO_LIBRETRANSLATE_LANG = {
+    "zh": "zh-Hans",
+    "zh-cn": "zh-Hans",
+    "zh-tw": "zh-Hant",
+}
+
+
+def _normalise_lang_for_libretranslate(code: str) -> str:
+    if not code:
+        return code
+    code = code.lower()
+    return _WHISPER_TO_LIBRETRANSLATE_LANG.get(code, code)
+
+
+async def _libretranslate(text: str, source: str, target: str) -> str:
+    """Call LibreTranslate. Raises on network or HTTP errors; caller maps to 502."""
+    import httpx  # imported lazily so servers without LIBRETRANSLATE_URL still start
+    src = _normalise_lang_for_libretranslate(source) or "auto"
+    tgt = _normalise_lang_for_libretranslate(target)
+    payload: dict = {"q": text, "source": src, "target": tgt, "format": "text"}
+    if LIBRETRANSLATE_API_KEY:
+        payload["api_key"] = LIBRETRANSLATE_API_KEY
+    async with httpx.AsyncClient(timeout=LIBRETRANSLATE_TIMEOUT_S) as client:
+        r = await client.post(f"{LIBRETRANSLATE_URL}/translate", json=payload)
+        r.raise_for_status()
+        data = r.json()
+    out = data.get("translatedText")
+    if not isinstance(out, str):
+        raise RuntimeError(f"Unexpected LibreTranslate response: {data}")
+    return out
+
+
 @app.post("/v1/audio/translations")
 async def create_translation(
     file: UploadFile = File(...),
     prompt: Optional[str] = Form(None),
     response_format: Optional[str] = Form("json"),
-    temperature: float = Form(0.0)
+    temperature: float = Form(0.0),
+    to_language: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
 ):
-    """OpenAI-compatible translation endpoint. Returns English text."""
+    """
+    OpenAI-compatible translation endpoint.
+
+    When `LIBRETRANSLATE_URL` is configured (recommended), the audio is
+    first transcribed with Whisper (in the source language, either
+    auto-detected or forced via the `language` form field) and the text
+    is then sent to LibreTranslate to reach `to_language` (default
+    `"en"` for OpenAI-compatibility). This path supports any target
+    language supported by the LibreTranslate instance, not only English.
+
+    When `LIBRETRANSLATE_URL` is empty, the endpoint falls back to the
+    legacy Whisper-native `translate` task, which is English-only and
+    works poorly on models that were not trained for it (e.g.
+    whisper-large-v3-turbo).
+    """
     if whisper_model is None:
         raise HTTPException(status_code=500, detail="Model not loaded.")
+    target_lang = (to_language or "en").lower()
     try:
         contents = await file.read()
         audio_dur = _get_audio_duration(contents)
@@ -953,12 +1029,16 @@ async def create_translation(
         global _work_queue_audio_seconds
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+
+        # Route: if LibreTranslate is configured, do a plain transcription
+        # and translate the text afterwards. Otherwise, legacy native
+        # Whisper translate (English-only).
         item = _WorkItem(
             audio_bytes=contents,
-            language=None,
+            language=language,
             prompt=prompt,
             temperature=temperature,
-            task="translate",
+            task="transcribe" if LIBRETRANSLATE_URL else "translate",
             audio_dur=audio_dur,
             future=future,
         )
@@ -968,11 +1048,43 @@ async def create_translation(
         res = await future
         route = item.route
 
-        data = res["text"] if response_format == "text" else res
+        # Legacy path: no LibreTranslate, return Whisper native translation.
+        if not LIBRETRANSLATE_URL:
+            data = res["text"] if response_format == "text" else res
+            if response_format == "text":
+                from fastapi.responses import PlainTextResponse
+                return PlainTextResponse(content=data, headers={"X-Route": route})
+            return JSONResponse(content=data, headers={"X-Route": route})
+
+        # LibreTranslate path.
+        text = (res.get("text") or "").strip()
+        source_lang = (res.get("language") or "").lower()
+        log_debug(
+            f"[translate] source={source_lang!r} target={target_lang!r} "
+            f"route={route} text_preview={text[:80]!r}"
+        )
+
+        if not text:
+            out_text = text
+        elif source_lang and source_lang == target_lang:
+            out_text = text  # no-op shortcut
+        else:
+            try:
+                out_text = await _libretranslate(text, source_lang, target_lang)
+            except Exception as e:
+                print(f"ERROR in _libretranslate: {e}", flush=True)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Translation backend failure: {type(e).__name__}: {e}",
+                )
+
         if response_format == "text":
             from fastapi.responses import PlainTextResponse
-            return PlainTextResponse(content=data, headers={"X-Route": route})
-        return JSONResponse(content=data, headers={"X-Route": route})
+            return PlainTextResponse(content=out_text, headers={"X-Route": route})
+        return JSONResponse(content={"text": out_text}, headers={"X-Route": route})
+
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"ERROR in create_translation: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Translation failed. Check server logs.")

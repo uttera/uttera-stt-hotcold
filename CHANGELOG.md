@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-04-17
+
+Translation endpoint upgrade — now works reliably on any Whisper
+variant (including `turbo`, which handles the native `translate`
+task poorly) and supports arbitrary target languages, not only
+English. Matches the behaviour landed in
+[`uttera-stt-vllm` v1.1.0](https://github.com/uttera/uttera-stt-vllm/releases/tag/v1.1.0).
+
+### Added
+- **LibreTranslate post-processing pipeline for `/v1/audio/translations`**.
+  When `LIBRETRANSLATE_URL` is configured, the endpoint first
+  transcribes the audio with Whisper (in the source language, either
+  auto-detected or forced via the new `language` form field), then
+  posts the text to a LibreTranslate instance for the final
+  translation. Benefits:
+  1. Works with any multilingual Whisper model, including ones where
+     the native `translate` task gives poor output.
+  2. Supports `to_language` targets beyond English via a new request
+     form field (default `"en"` for OpenAI-compatibility).
+  3. Decouples transcription quality from translation quality.
+- New env vars:
+  - `LIBRETRANSLATE_URL` — base URL of a LibreTranslate instance
+    (e.g. `http://localhost:5200`).
+  - `LIBRETRANSLATE_API_KEY` — optional key if your LibreTranslate
+    instance requires one.
+  - `LIBRETRANSLATE_TIMEOUT_S` — HTTP timeout for the translation
+    call (default 30 s).
+- New `/v1/audio/translations` form fields: `to_language` (target,
+  default `"en"`) and `language` (optional source hint forwarded to
+  Whisper).
+- `httpx>=0.27.0` added to `requirements.txt`; imported lazily from
+  `_libretranslate()` so the server still starts on systems without
+  it if the endpoint is never called.
+
+### Changed
+- **`SERVER_VERSION` bumped to `2.1.0`.**
+- `/v1/audio/translations` behaviour when the detected source
+  language equals `to_language`: LibreTranslate is skipped and the
+  raw Whisper transcription is returned — saves a round-trip for
+  the no-op case.
+- LibreTranslate failure returns HTTP 502 (network, HTTP error, or
+  malformed response). **No silent fallback to the untranslated
+  transcription**: leaking source-language text under a response
+  schema that promises the target language would be a correctness
+  bug, not a graceful degradation.
+
+### Backward compatibility
+- When `LIBRETRANSLATE_URL` is empty (the default), the endpoint
+  falls back to the legacy Whisper-native `translate` path
+  (English-only). Existing deployments do not need to change
+  anything for the API contract to keep working.
+
+### Known limitations
+- Whisper emits ISO-639-1 codes for most languages, but for Chinese
+  it emits `zh` while LibreTranslate expects `zh-Hans` / `zh-Hant`.
+  A small mapping in `main_stt.py` handles this; other edge cases
+  may surface for rarely-used codes.
+
 ## [2.0.0] - 2026-04-16
 
 First Uttera-branded release. Rebrand from "Whisper STT Server" to
