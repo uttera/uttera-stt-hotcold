@@ -68,7 +68,7 @@ test-clean and an internal Spanish WAV corpus).
   - **Cold Workers:** Spawns on-demand subprocesses when the GPU is busy, ensuring long audio files don't block quick voice commands.
 - **GPU Accelerated:** Native support for NVIDIA CUDA, ensuring ultra-fast inference.
 - **OpenAI Compatible:** Implements the standard OpenAI STT API (`/v1/audio/transcriptions`, `/v1/audio/translations`). Includes `GET /v1/models` for client autodiscovery.
-- **Translation:** `POST /v1/audio/translations` transcribes audio in any language and returns English text in a single Whisper pass.
+- **Translation (v2.1.0+):** `POST /v1/audio/translations` supports arbitrary target languages via a Whisper-transcribe → LibreTranslate pipeline when `LIBRETRANSLATE_URL` is set (request field `to_language`, default `"en"`). Without `LIBRETRANSLATE_URL`, falls back to Whisper's native translate task (English only; works poorly on models like `turbo` that were not trained for it).
 - **Multilingual:** Supports all languages covered by Whisper (99 languages). Auto-detects language if not specified.
 - **Health Endpoint:** `GET /health` exposes server version, model name, and hot worker status for proxies and Docker healthchecks.
 - **Privacy First:** 100% local execution. Your audio never leaves your infrastructure.
@@ -142,7 +142,7 @@ The server listens on port `5000` by default. Ensure the user has permissions to
 | `GET` | `/health` | Server liveness, version, and hot worker status. |
 | `GET` | `/v1/models` | OpenAI-compatible model list (`whisper-1`). |
 | `POST` | `/v1/audio/transcriptions` | Transcribe audio to text (Hot or Cold Lane). |
-| `POST` | `/v1/audio/translations` | Transcribe audio in any language → English (Hot or Cold Lane). |
+| `POST` | `/v1/audio/translations` | Transcribe + translate to `to_language` (default `en`). With `LIBRETRANSLATE_URL`: any target language. Without: English only (Whisper native). |
 
 ## 🛠 Execution
 

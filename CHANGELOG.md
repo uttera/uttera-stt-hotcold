@@ -63,6 +63,30 @@ English. Matches the behaviour landed in
   A small mapping in `main_stt.py` handles this; other edge cases
   may surface for rarely-used codes.
 
+### Validated
+End-to-end smoke test on a fresh clone of this tag (`v2.1.0`) with
+`WHISPER_MODEL=turbo` and LibreTranslate at
+`http://sphinx:5200`. Every case returns HTTP 200 and the expected
+body:
+
+1. `to_language=en`, LibreTranslate on → English text.
+2. `to_language=fr`, LibreTranslate on → French text.
+3. `to_language=es` (same as detected source), LibreTranslate on →
+   LibreTranslate skipped, raw Whisper transcription returned.
+4. No `to_language` supplied, LibreTranslate on → defaults to `en`,
+   English text.
+5. `LIBRETRANSLATE_URL` unset → legacy Whisper-native translate
+   path. Endpoint responds 200; with `turbo` the body is Spanish
+   (model limitation — documented, not a regression). The path
+   itself is proven alive.
+6. `/v1/audio/transcriptions` unaffected by either configuration.
+
+Response-shape note: the LibreTranslate path returns
+`{"text": "..."}` (OpenAI-minimal). The legacy path returns the full
+Whisper dict (`text`, `segments`, `tokens`, `language`). Existing
+clients that only read `text` are unaffected; clients that read
+`segments`/`tokens` should rely on the legacy path.
+
 ## [2.0.0] - 2026-04-16
 
 First Uttera-branded release. Rebrand from "Whisper STT Server" to
