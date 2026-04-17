@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main, "experimental/*"]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install linters
+        run: pip install ruff
+      - name: Lint Python
+        run: |
+          ruff check main_stt.py cold_worker.py --select E,F,W --ignore E501
+
+  structure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate requirements file
+        run: |
+          test -f requirements.txt || { echo "MISSING: requirements.txt"; exit 1; }
+          python -c "
+          with open('requirements.txt') as fh:
+              for line in fh:
+                  line = line.strip()
+                  if line and not line.startswith('#') and not line.startswith('-r'):
+                      print(f'  {line}')
+          "
+          echo "requirements.txt OK."
+      - name: Validate server module syntax
+        run: |
+          python -m py_compile main_stt.py
+          python -m py_compile cold_worker.py
+          echo "main_stt.py + cold_worker.py parse cleanly."
+      - name: Validate endpoint declarations
+        run: |
+          python -c "
+          src = open('main_stt.py').read()
+          required_routes = [
+              '/v1/audio/transcriptions',
+              '/v1/audio/translations',
+              '/v1/models',
+              '/health',
+          ]
+          for r in required_routes:
+              assert r in src, f'Route missing from main_stt.py: {r}'
+              print(f'Route OK: {r}')
+          "
+
+  # GPU smoke test — only runs on self-hosted runners with NVIDIA GPU.
+  # Skip on GitHub-hosted runners (no GPU available).
+  smoke-whisper:
+    runs-on: [self-hosted, gpu]
+    if: false  # Enable when a self-hosted GPU runner is configured
+    needs: [lint, structure]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup venv + install
+        run: |
+          python3.12 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Start server
+        run: |
+          source venv/bin/activate
+          WHISPER_MODEL=tiny \
+            uvicorn main_stt:app --host 127.0.0.1 --port 5001 &
+          for i in $(seq 1 60); do
+            sleep 2
+            curl -sf http://127.0.0.1:5001/health && break
+          done
+      - name: Health check
+        run: |
+          HEALTH=$(curl -s http://127.0.0.1:5001/health)
+          echo "$HEALTH" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d['status'] == 'ok', f'Health not ok: {d}'
+          assert d['hot_worker_loaded'], 'Hot worker not loaded'
+          print('Health check passed.')
+          "
