@@ -30,6 +30,37 @@ bookmarks, and links keep working. If you still have
 git remote set-url origin https://github.com/uttera/uttera-stt-hotcold.git
 ```
 
+## Positioning
+
+| Use case | This repo | Sibling repo |
+|---|---|---|
+| Home-lab, personal, small/mid GPU (8–16 GB) | ✅ [uttera-stt-hotcold](https://github.com/uttera/uttera-stt-hotcold) | — |
+| Cloud, multi-tenant, large GPU (≥24 GB) | — | [uttera-stt-vllm](https://github.com/uttera/uttera-stt-vllm) |
+
+**Choose `uttera-stt-hotcold` when**:
+- You have consumer GPUs (RTX 4070, 4080) and transcribe occasionally.
+- Personal or single-user deployment.
+- You want to share the GPU with other workloads.
+- **You have 8–24 GB of VRAM.** vLLM does not fit comfortably in this
+  range: at 8–16 GB the KV cache is too small for continuous batching
+  to beat hotcold; at 16–24 GB vLLM works but reserves 11–22 GB
+  permanently, wasting the co-location flexibility that is hotcold's
+  reason to exist on mid-sized GPUs.
+
+**Choose `uttera-stt-vllm` when**:
+- You transcribe hours of audio per day across many concurrent streams.
+- You want continuous batching to maximise GPU utilisation.
+- You have large-VRAM GPUs dedicated to inference.
+- **You have 32 GB+ of VRAM** (vLLM reserves ~22–29 GB at startup
+  depending on `gpu_memory_utilization`; below 32 GB total you either
+  run out of headroom or lose the batching advantage that justifies
+  the reservation).
+
+See [`uttera-benchmarks`](https://github.com/uttera/uttera-benchmarks)
+for reproducible head-to-head numbers across four load profiles
+(latency, burst up to N=1024, sustained) and two corpora (LibriSpeech
+test-clean and an internal Spanish WAV corpus).
+
 ## 🚀 Key Features
 
 - **Hybrid Concurrency:**
