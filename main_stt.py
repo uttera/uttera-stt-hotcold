@@ -11,11 +11,15 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-hotcold
-# Version: 2.2.0
+# Version: 2.2.1
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 2.2.1 (2026-04-18): /v1/models `owned_by` field now reports "uttera"
+#   instead of the stale "uttera-legacy" string left over from pre-rebrand.
+#   Cosmetic only — the field is free-form in the OpenAI spec, so no
+#   client compatibility impact.
 # - 2.2.0 (2026-04-17): OpenAI-compat polish sweep. Seven endpoint/feature
 #   fixes identified in the full-endpoint validation sweep (256-request
 #   burst + 19 single-shot tests):
@@ -196,7 +200,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "2.2.0"
+SERVER_VERSION = "2.2.1"
 
 # Valid response formats per OpenAI spec
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "vtt", "verbose_json"}
@@ -916,7 +920,7 @@ async def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": "whisper-1", "object": "model", "created": 1677610602, "owned_by": "uttera-legacy"},
+            {"id": "whisper-1", "object": "model", "created": 1677610602, "owned_by": "uttera"},
         ]
     }
 
