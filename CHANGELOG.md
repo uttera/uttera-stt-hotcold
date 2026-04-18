@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-04-17
+
+OpenAI-compatibility polish sweep. After a full endpoint validation
+run (256-request concurrent burst + 19 single-shot feature tests
+across both `/v1/audio/transcriptions` and `/v1/audio/translations`),
+seven rough edges were identified and are now fixed. All fixes are
+backward-compatible — existing clients see no change, strict clients
+now get the documented OpenAI contract instead of approximations.
+
+### Added
+- **Real SRT / WebVTT / verbose_json responses**. `response_format`
+  now honours every value in the OpenAI spec:
+  - `json` → `{"text": "..."}` (OpenAI-compact; unchanged default).
+  - `text` → plain text body (unchanged).
+  - `verbose_json` → full Whisper result including segments, language
+    detection, token logprobs.
+  - `srt` → SubRip subtitle file with correctly formatted timecodes
+    (`HH:MM:SS,mmm`), one segment per cue.
+  - `vtt` → WebVTT subtitle file (`HH:MM:SS.mmm`) with the `WEBVTT`
+    header.
+  Previously `srt`, `vtt`, and `verbose_json` all fell through to the
+  compact JSON form, which was a silent spec violation.
+- **`HEAD /health` support**. Load balancers and uptime probes that
+  use HEAD requests no longer receive HTTP 405. Same body shape as
+  `GET /health`, but without the body — FastAPI handles the HEAD
+  semantics automatically.
+- **Opt-in `CORSMiddleware`**. Set `CORS_ALLOW_ORIGINS` to a
+  comma-separated list of origins, or `"*"` to allow all. Exposes
+  the `X-Route` and `X-Translation-Mode` response headers to browser
+  clients. Disabled by default — API-first deployments don't need
+  CORS, and enabling it unconditionally broadens the attack surface.
+- **`X-Translation-Mode: libretranslate` response header** on
+  `/v1/audio/translations` when the LibreTranslate post-processing
+  path is used (vs. the legacy Whisper-native path). Helps clients
+  and observability tooling tell the two modes apart.
+- **`temperature` range validation**. Values outside `[0.0, 1.0]` are
+  rejected with HTTP 422 and an explicit message, matching the OpenAI
+  spec. Previously any float was silently accepted and passed to
+  Whisper, where `temperature=99` produced gibberish with no error.
+
+### Changed
+- **`SERVER_VERSION` bumped to `2.2.0`.**
+- **`/v1/audio/translations` with `to_language != "en"` and no
+  `LIBRETRANSLATE_URL` now returns HTTP 400** with a message naming
+  the missing env var. Previously this combination silently fell back
+  to English — a contract violation, since the caller explicitly
+  asked for another target. Configure `LIBRETRANSLATE_URL` to enable
+  arbitrary target languages.
+- **Whisper "Unsupported language: XX" errors now surface as
+  HTTP 400** with the actual message, on both transcriptions and
+  translations. Previously the exception was caught by the generic
+  `except Exception` and turned into HTTP 500 with the opaque
+  "Transcription failed. Check server logs." detail, forcing clients
+  to SSH into the server to discover they'd sent a bad language code.
+- **Non-audio / undecodeable file bodies now return HTTP 400**
+  (typed decode error: `"Failed to decode audio: <ExceptionType>: <msg>"`)
+  instead of HTTP 500. A client sending a text file or unsupported
+  codec is a client error, not a server fault.
+- **`response_format` is validated before any work is scheduled**.
+  Invalid values return HTTP 422 immediately instead of being
+  silently downgraded to `json`.
+
+### Backward compatibility
+- Every previously valid request continues to return exactly the same
+  response shape. Only previously-undocumented or silently-accepted
+  inputs now get explicit rejections.
+- Default `response_format=json` behaviour is unchanged.
+- CORS is disabled by default — existing deployments see no header
+  changes unless they explicitly opt in.
+- The legacy Whisper-native translate path is unchanged as long as
+  callers use `to_language="en"` (or omit the field).
+
 ## [2.1.0] - 2026-04-17
 
 Translation endpoint upgrade — now works reliably on any Whisper

@@ -11,11 +11,34 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-hotcold
-# Version: 2.1.0
+# Version: 2.2.0
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 2.2.0 (2026-04-17): OpenAI-compat polish sweep. Seven endpoint/feature
+#   fixes identified in the full-endpoint validation sweep (256-request
+#   burst + 19 single-shot tests):
+#   1. response_format=srt|vtt|verbose_json now return correctly shaped
+#      bodies (SRT / WebVTT timed subtitles and full whisper result) via
+#      _render_response() + _segments_to_srt/_segments_to_vtt helpers.
+#   2. to_language != "en" with LIBRETRANSLATE_URL unset now returns 400
+#      with an explicit message instead of silently falling back to
+#      English (contract-surprise).
+#   3. Whisper "Unsupported language: XX" now surfaces as HTTP 400 with
+#      the actual message (was previously swallowed into a generic 500
+#      "Transcription failed. Check server logs.").
+#   4. Non-audio / undecodeable file bodies now return HTTP 400 with a
+#      typed decode error instead of 500.
+#   5. temperature is validated against [0.0, 1.0] (OpenAI spec) and
+#      out-of-range values rejected with HTTP 422.
+#   6. HEAD /health is now accepted (uptime probes used by load
+#      balancers no longer see spurious 405s).
+#   7. Opt-in CORSMiddleware registered when CORS_ALLOW_ORIGINS env var
+#      is set (comma-separated list, or "*" for all). Default is off,
+#      preserving the API-first posture.
+#   Also added: X-Translation-Mode: libretranslate response header on
+#   the LibreTranslate-mediated translation path, for observability.
 # - 2.1.0 (2026-04-17): /v1/audio/translations now works via a
 #   Whisper-transcribe → LibreTranslate post-processing pipeline when
 #   the new LIBRETRANSLATE_URL env var is set. Supports arbitrary
@@ -154,7 +177,8 @@ import json
 import dataclasses
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Optional, Set
@@ -172,7 +196,14 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
+
+# Valid response formats per OpenAI spec
+SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "vtt", "verbose_json"}
+
+# Valid temperature range per OpenAI spec [0.0, 1.0]
+TEMPERATURE_MIN = 0.0
+TEMPERATURE_MAX = 1.0
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
@@ -314,6 +345,20 @@ async def _lifespan(application: FastAPI):
 
 
 app = FastAPI(title="Uttera STT Server", version=SERVER_VERSION, lifespan=_lifespan)
+
+# CORS middleware (disabled by default — API-first deployments don't need it).
+# Set CORS_ALLOW_ORIGINS to a comma-separated list of origins, or "*" to allow all.
+_cors_origins_env = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+if _cors_origins_env:
+    _cors_origins = ["*"] if _cors_origins_env == "*" else [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["X-Route", "X-Translation-Mode"],
+    )
 
 # -------------------------------
 # 2. Model Loading
@@ -875,7 +920,7 @@ async def list_models():
         ]
     }
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     _free = _free_vram_gb()
     optimal = _optimal_cold_workers()
@@ -918,6 +963,96 @@ async def health_check():
         "smart_routing": routing_stats,
     }
 
+def _validate_common_params(response_format: str, temperature: float) -> None:
+    """Validate OpenAI-compat request params before doing any work. Raises HTTPException."""
+    if response_format not in SUPPORTED_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"response_format '{response_format}' is not supported. "
+                f"Valid values: {sorted(SUPPORTED_RESPONSE_FORMATS)}"
+            ),
+        )
+    if not (TEMPERATURE_MIN <= temperature <= TEMPERATURE_MAX):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"temperature {temperature} out of range. "
+                f"Must be in [{TEMPERATURE_MIN}, {TEMPERATURE_MAX}]."
+            ),
+        )
+
+
+def _format_timestamp_srt(seconds: float) -> str:
+    """Format seconds as HH:MM:SS,mmm for SRT."""
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _format_timestamp_vtt(seconds: float) -> str:
+    """Format seconds as HH:MM:SS.mmm for WebVTT."""
+    return _format_timestamp_srt(seconds).replace(",", ".")
+
+
+def _segments_to_srt(segments: list) -> str:
+    """Convert whisper segments list to SRT."""
+    lines = []
+    for i, seg in enumerate(segments, start=1):
+        start = _format_timestamp_srt(seg.get("start", 0.0))
+        end = _format_timestamp_srt(seg.get("end", 0.0))
+        text = (seg.get("text") or "").strip()
+        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
+
+
+def _segments_to_vtt(segments: list) -> str:
+    """Convert whisper segments list to WebVTT."""
+    lines = ["WEBVTT", ""]
+    for seg in segments:
+        start = _format_timestamp_vtt(seg.get("start", 0.0))
+        end = _format_timestamp_vtt(seg.get("end", 0.0))
+        text = (seg.get("text") or "").strip()
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _render_response(res: dict, response_format: str, route: str, extra_headers: dict | None = None) -> Response:
+    """Render the whisper result dict as the requested response_format per OpenAI spec.
+
+    - `json`: OpenAI-compact `{"text": "..."}`
+    - `text`: plain text body
+    - `verbose_json`: full whisper result (text + segments + language + logprobs)
+    - `srt`: SRT subtitle format
+    - `vtt`: WebVTT subtitle format
+    """
+    headers = {"X-Route": route, **(extra_headers or {})}
+    text = (res.get("text") or "")
+    if response_format == "text":
+        return PlainTextResponse(content=text, headers=headers)
+    if response_format == "srt":
+        return PlainTextResponse(
+            content=_segments_to_srt(res.get("segments") or []),
+            media_type="application/x-subrip",
+            headers=headers,
+        )
+    if response_format == "vtt":
+        return PlainTextResponse(
+            content=_segments_to_vtt(res.get("segments") or []),
+            media_type="text/vtt",
+            headers=headers,
+        )
+    if response_format == "verbose_json":
+        # Whisper's raw result IS the verbose format (segments+language+logprobs).
+        return JSONResponse(content=res, headers=headers)
+    # Default: OpenAI-compact json — only {"text": ...}.
+    return JSONResponse(content={"text": text}, headers=headers)
+
+
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
     file: UploadFile = File(...),
@@ -928,9 +1063,18 @@ async def create_transcription(
 ):
     if whisper_model is None:
         raise HTTPException(status_code=500, detail="Model not loaded.")
+    _validate_common_params(response_format, temperature)
     try:
         contents = await file.read()
-        audio_dur = _get_audio_duration(contents)
+        try:
+            audio_dur = _get_audio_duration(contents)
+        except Exception as e:
+            # ffmpeg / libsndfile failed to decode — client sent a non-audio file
+            # or an unsupported codec. 400 is the right answer.
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to decode audio: {type(e).__name__}: {str(e)[:200]}",
+            )
 
         global _work_queue_audio_seconds
         loop = asyncio.get_running_loop()
@@ -949,13 +1093,31 @@ async def create_transcription(
 
         res = await future
         route = item.route
-
-        data = res["text"] if response_format == "text" else res
-        if response_format == "text":
-            from fastapi.responses import PlainTextResponse
-            return PlainTextResponse(content=data, headers={"X-Route": route})
-        return JSONResponse(content=data, headers={"X-Route": route})
+        return _render_response(res, response_format, route)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # Whisper raises ValueError for "Unsupported language: XX" and similar.
+        # Surface the actual message instead of a generic 500.
+        msg = str(e)
+        print(f"ERROR in create_transcription (ValueError): {msg}", flush=True)
+        raise HTTPException(status_code=400, detail=msg)
     except Exception as e:
+        # Re-raise known HTTP errors, but surface ValueError from the worker loop too.
+        msg = str(e)
+        if isinstance(e, ValueError) or "Unsupported language" in msg or ("language" in msg.lower() and "not supported" in msg.lower()):
+            print(f"ERROR in create_transcription (language): {msg}", flush=True)
+            raise HTTPException(status_code=400, detail=msg)
+        # Whisper's "Failed to load audio: ..." comes from ffmpeg choking on
+        # a non-audio / unsupported-codec body — a client error, not a server
+        # fault. Truncate the ffmpeg output since it includes the full build
+        # banner on every failure.
+        if "Failed to load audio" in msg:
+            print(f"ERROR in create_transcription (decode): {msg[:200]}", flush=True)
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to decode audio body — not a valid audio stream or unsupported codec.",
+            )
         print(f"ERROR in create_transcription: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Transcription failed. Check server logs.")
     finally:
@@ -1021,10 +1183,33 @@ async def create_translation(
     """
     if whisper_model is None:
         raise HTTPException(status_code=500, detail="Model not loaded.")
+    _validate_common_params(response_format, temperature)
     target_lang = (to_language or "en").lower()
+
+    # Contract gate: in legacy Whisper-native mode (no LibreTranslate configured)
+    # only target=en is actually supported. Silently falling back to English
+    # when the caller explicitly asked for another language is a contract
+    # violation, so reject with 400 instead.
+    if not LIBRETRANSLATE_URL and target_lang != "en":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"to_language={target_lang!r} requested but LIBRETRANSLATE_URL is not "
+                f"configured on this server. Only 'en' is supported in legacy "
+                f"Whisper-native translate mode. Configure LIBRETRANSLATE_URL "
+                f"to enable arbitrary target languages."
+            ),
+        )
+
     try:
         contents = await file.read()
-        audio_dur = _get_audio_duration(contents)
+        try:
+            audio_dur = _get_audio_duration(contents)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to decode audio: {type(e).__name__}: {str(e)[:200]}",
+            )
 
         global _work_queue_audio_seconds
         loop = asyncio.get_running_loop()
@@ -1050,11 +1235,7 @@ async def create_translation(
 
         # Legacy path: no LibreTranslate, return Whisper native translation.
         if not LIBRETRANSLATE_URL:
-            data = res["text"] if response_format == "text" else res
-            if response_format == "text":
-                from fastapi.responses import PlainTextResponse
-                return PlainTextResponse(content=data, headers={"X-Route": route})
-            return JSONResponse(content=data, headers={"X-Route": route})
+            return _render_response(res, response_format, route)
 
         # LibreTranslate path.
         text = (res.get("text") or "").strip()
@@ -1078,14 +1259,31 @@ async def create_translation(
                     detail=f"Translation backend failure: {type(e).__name__}: {e}",
                 )
 
-        if response_format == "text":
-            from fastapi.responses import PlainTextResponse
-            return PlainTextResponse(content=out_text, headers={"X-Route": route})
-        return JSONResponse(content={"text": out_text}, headers={"X-Route": route})
+        # Rebuild a whisper-shaped result dict with the translated text so
+        # _render_response can handle every format (including srt/vtt, which
+        # need the original segments — we preserve them since timings stay valid).
+        out_res = dict(res)
+        out_res["text"] = out_text
+        extra_headers = {"X-Translation-Mode": "libretranslate"}
+        return _render_response(out_res, response_format, route, extra_headers=extra_headers)
 
     except HTTPException:
         raise
+    except ValueError as e:
+        msg = str(e)
+        print(f"ERROR in create_translation (ValueError): {msg}", flush=True)
+        raise HTTPException(status_code=400, detail=msg)
     except Exception as e:
+        msg = str(e)
+        if "Unsupported language" in msg or ("language" in msg.lower() and "not supported" in msg.lower()):
+            print(f"ERROR in create_translation (language): {msg}", flush=True)
+            raise HTTPException(status_code=400, detail=msg)
+        if "Failed to load audio" in msg:
+            print(f"ERROR in create_translation (decode): {msg[:200]}", flush=True)
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to decode audio body — not a valid audio stream or unsupported codec.",
+            )
         print(f"ERROR in create_translation: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Translation failed. Check server logs.")
     finally:
