@@ -11,11 +11,27 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-hotcold
-# Version: 2.2.1
+# Version: 2.3.0
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 2.3.0 (2026-04-18): Default port migrated from 5000 → 9005. The
+#   OpenAI spec does not mandate a port for self-hosted compatible
+#   servers; we formalise 9005 as the canonical Uttera-stack port for
+#   ALL Speech-to-Text backends (hotcold + vllm variants), matching
+#   its TTS counterpart on 9004. Rationale: port 5000 has known
+#   collisions with macOS AirPlay Receiver (since Monterey) and with
+#   Docker Registry v2 (5000 is its default). Range 9000–9099 is IANA
+#   "User Ports" without canonical assignment and is collision-free
+#   on mainstream systems. All repo artefacts updated: `--port`
+#   defaults in main_stt.py + README, Dockerfile EXPOSE, docker-
+#   compose port mapping, CI workflow probes, .env.example PORT and
+#   NODE_PORT defaults, API.md base URL. Migration for existing
+#   deployments: set `PORT=5000` (or the previous value) in your env
+#   if you need to preserve the old endpoint, otherwise point your
+#   Gatekeeper / reverse proxy at `:9005`. See also uttera-stt-vllm
+#   v1.3.0 (sibling sharing the same port).
 # - 2.2.1 (2026-04-18): /v1/models `owned_by` field now reports "uttera"
 #   instead of the stale "uttera-legacy" string left over from pre-rebrand.
 #   Cosmetic only — the field is free-form in the OpenAI spec, so no
@@ -200,7 +216,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "2.2.1"
+SERVER_VERSION = "2.3.0"
 
 # Valid response formats per OpenAI spec
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "vtt", "verbose_json"}
@@ -279,9 +295,9 @@ LIBRETRANSLATE_TIMEOUT_S = float(os.environ.get("LIBRETRANSLATE_TIMEOUT_S", "30"
 # NODE_ID defaults to HOST:PORT. TTL is set to 3× the pool manager interval so
 # the key expires automatically if the node dies or Redis becomes unreachable.
 REDIS_URL     = os.environ.get("REDIS_URL", "")
-REDIS_NODE_ID = os.environ.get("NODE_ID", "") or f"{os.environ.get('NODE_HOST', 'localhost')}:{os.environ.get('NODE_PORT', '5000')}"
+REDIS_NODE_ID = os.environ.get("NODE_ID", "") or f"{os.environ.get('NODE_HOST', 'localhost')}:{os.environ.get('NODE_PORT', '9005')}"
 REDIS_NODE_HOST = os.environ.get("NODE_HOST", "localhost")
-REDIS_NODE_PORT = int(os.environ.get("NODE_PORT", "5000"))
+REDIS_NODE_PORT = int(os.environ.get("NODE_PORT", "9005"))
 REDIS_KEY     = f"stt:nodes:{REDIS_NODE_ID}"
 REDIS_TTL     = max(2, int(COLD_POOL_MANAGER_INTERVAL * 3 + 1))  # seconds
 
@@ -1294,4 +1310,4 @@ async def create_translation(
         await file.close()
 
 if __name__ == "__main__":
-    uvicorn.run("main_stt:app", host="0.0.0.0", port=5000, log_level="info")
+    uvicorn.run("main_stt:app", host="0.0.0.0", port=9005, log_level="info")

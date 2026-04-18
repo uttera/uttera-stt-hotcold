@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-04-18
+
+### Changed
+
+- **Default port migrated from `5000` → `9005`.** Formalising the
+  canonical Uttera-stack port scheme: all Speech-to-Text backends
+  (both `uttera-stt-hotcold` and `uttera-stt-vllm`) now default to
+  port `9005`, and all Text-to-Speech backends default to `9004`.
+  The Gatekeeper and clients can route by service family without
+  knowing which backend is behind it.
+
+  **Why move off `5000`:**
+  - Known collision with **macOS AirPlay Receiver** (since Monterey).
+    Flask's default port 5000 was famously broken by this in 2021.
+  - **Docker Registry v2** uses port 5000 by default — running a
+    local registry on the same host would conflict.
+  - Range `9000-9099` is IANA "User Ports" without canonical
+    assignment and has no mainstream collisions.
+
+  **Why `9005` and not, say, `8005`:** 8000/8080 are heavily used by
+  HTTP dev servers. 9004/9005 reserve two adjacent, clean ports
+  specifically for the Uttera TTS/STT pair.
+
+  **Artefacts updated:** `main_stt.py` runtime default, `README.md`
+  port references and env-var table, `API.md` base URL, `Dockerfile`
+  `EXPOSE`, `docker-compose.yml` port mapping, `.env.example` `PORT`
+  and `NODE_PORT` defaults, `.github/workflows/ci.yml` health-probe
+  URLs, `.github/ISSUE_TEMPLATE/bug_report.yml` health-curl command.
+
+### Migration
+
+No code change is required for existing deployments that override
+`PORT` via env var. For deployments running on the old default:
+- **If the Gatekeeper was pointing at `:5000`:** repoint it at `:9005`.
+- **If you need to keep `:5000`:** set `PORT=5000` in the server's env.
+- **Docker users:** update your `-p` flag or `docker-compose.yml`.
+
+### Related
+
+- `uttera-stt-vllm` v1.3.0 adopts the same `9005` port in lockstep.
+- `uttera-tts-hotcold` v2.3.0 and `uttera-tts-vllm` v1.3.0 adopt `9004`
+  on the TTS side.
+
 ## [2.2.1] - 2026-04-18
 
 ### Changed

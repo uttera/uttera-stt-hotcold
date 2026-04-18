@@ -27,6 +27,6 @@ COPY . .
 # Model cache lives in a volume — create the directory structure
 RUN mkdir -p assets/models/whisper assets/cache
 
-EXPOSE 5000
+EXPOSE 9005
 
-CMD ["./venv/bin/uvicorn", "main_stt:app", "--host", "0.0.0.0", "--port", "5000"]
+CMD ["./venv/bin/uvicorn", "main_stt:app", "--host", "0.0.0.0", "--port", "9005"]

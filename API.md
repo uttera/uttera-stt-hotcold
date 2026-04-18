@@ -2,7 +2,7 @@
 
 The server provides an OpenAI-compatible API for high-performance speech-to-text transcription and translation.
 
-**Base URL:** `http://localhost:5000`
+**Base URL:** `http://localhost:9005`
 
 ---
 
@@ -109,7 +109,7 @@ OpenAI-compatible model listing. Returns the currently loaded Whisper model.
 
 **Example Request:**
 ```bash
-curl -X GET "http://localhost:5000/v1/models"
+curl -X GET "http://localhost:9005/v1/models"
 ```
 
 **Example Response:**
@@ -128,7 +128,7 @@ curl -X GET "http://localhost:5000/v1/models"
 
 ### Transcription (JSON)
 ```bash
-curl -X POST "http://localhost:5000/v1/audio/transcriptions" \
+curl -X POST "http://localhost:9005/v1/audio/transcriptions" \
      -F "file=@/path/to/audio.wav" \
      -F "language=es" \
      -F "response_format=json"
@@ -136,7 +136,7 @@ curl -X POST "http://localhost:5000/v1/audio/transcriptions" \
 
 ### Translation (to English)
 ```bash
-curl -X POST "http://localhost:5000/v1/audio/translations" \
+curl -X POST "http://localhost:9005/v1/audio/translations" \
      -F "file=@/path/to/spanish_audio.wav" \
      -F "response_format=text"
 ```

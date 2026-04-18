@@ -133,7 +133,7 @@ sudo usermod -aG render $USER
 *Note: Restart your session for changes to take effect.*
 
 ### 4. Network Permissions
-The server listens on port `5000` by default. Ensure the user has permissions to open sockets on this port (standard for ports >1024).
+The server listens on port `9005` by default. Ensure the user has permissions to open sockets on this port (standard for ports >1024).
 
 ## 📡 API Endpoints
 
@@ -153,10 +153,10 @@ The server uses direct **Uvicorn** execution for maximum ASGI performance.
 source venv/bin/activate
 
 # Localhost only
-uvicorn main_stt:app --host 127.0.0.1 --port 5000
+uvicorn main_stt:app --host 127.0.0.1 --port 9005
 
 # Expose to local network
-uvicorn main_stt:app --host 0.0.0.0 --port 5000
+uvicorn main_stt:app --host 0.0.0.0 --port 9005
 ```
 
 ### ⚙️ Environment Variables & .env
@@ -175,7 +175,7 @@ Copy `.env.example` to `.env` and adjust as needed. All variables are optional.
 | `ROUTING_DRAIN_CAP_SECONDS` | `120` | Queue drain time considered 100% load. |
 | `REDIS_URL` | *(empty)* | Redis URL for node self-registration (opt-in). |
 | `NODE_HOST` | `localhost` | Host advertised to Redis for Gatekeeper routing. |
-| `NODE_PORT` | `5000` | Port advertised to Redis for Gatekeeper routing. |
+| `NODE_PORT` | `9005` | Port advertised to Redis for Gatekeeper routing. |
 | `DEBUG` | `false` | Set to `true` to enable worker routing and subprocess traces. |
 | `VENV_PYTHON` | *(auto-detected)* | Path to venv Python. Auto-detected from `venv/bin/python`. |
 
@@ -194,7 +194,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/uttera-stt-hotcold
-ExecStart=%h/uttera-stt-hotcold/venv/bin/uvicorn main_stt:app --host 127.0.0.1 --port 5000
+ExecStart=%h/uttera-stt-hotcold/venv/bin/uvicorn main_stt:app --host 127.0.0.1 --port 9005
 Restart=always
 RestartSec=5
 
@@ -283,7 +283,7 @@ docker run --rm --device nvidia.com/gpu=all nvidia/cuda:12.4.1-runtime-ubuntu22.
 docker compose up -d
 
 # Check server is ready
-curl http://localhost:5000/health
+curl http://localhost:9005/health
 
 # View logs
 docker compose logs -f
@@ -295,7 +295,7 @@ docker compose down
 The model is persisted in `assets/models/whisper/` (host volume), so it only downloads once.
 
 ## 🔒 Security & Network Note
-By default, the server binds to **`127.0.0.1`** on port **`5000`**.
+By default, the server binds to **`127.0.0.1`** on port **`9005`**.
 - To allow external network access, change `--host` to `0.0.0.0`.
 - **WARNING**: This API **does not have authentication**. Exposing it to the network via `0.0.0.0` represents a security risk. Ensure the server is protected by a firewall or operating within a secure VPN/local network.
 
