@@ -5,6 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-04-21
+
+Prometheus `/metrics` endpoint. Additive only — all existing
+endpoints unchanged.
+
+### Added
+
+- **`GET /metrics`** — OpenMetrics-format scrape endpoint using the
+  default `prometheus_client` global registry. Scrape with Telegraf's
+  `inputs.prometheus`, Prometheus itself, or any OpenMetrics-
+  compatible consumer.
+- **Shared `uttera_stt_*` series** — same names and label shapes as
+  `uttera-stt-vllm` v1.4.0, so a single Grafana dashboard can
+  aggregate across both backends. The `engine` label in
+  `uttera_stt_build_info` differentiates the variant
+  (`whisper-hotcold` here, `vllm` on the sibling).
+  - `uttera_stt_requests_total{endpoint, method, status}`
+  - `uttera_stt_request_duration_seconds{endpoint, method}`
+  - `uttera_stt_inflight_requests`
+  - `uttera_stt_transcriptions_total{response_format}`
+  - `uttera_stt_translations_total{mode, response_format}` — mode
+    carries `libretranslate` / `native`
+  - `uttera_stt_audio_seconds_total{endpoint, route}`
+  - `uttera_stt_errors_total{type}` — decode / validation / model /
+    libretranslate
+  - `uttera_stt_engine_ready`, `uttera_stt_libretranslate_configured`
+  - `uttera_stt_build_info{version, engine, model}`
+- **Hot/cold-specific metrics** (additive — do not exist on the
+  vllm sibling):
+  - `uttera_stt_requests_by_route_total{route}` — route ∈
+    {`HOT`, `COLD-POOL`, `COLD-POOL>HOT`}
+  - `uttera_stt_cold_workers_active` — Gauge, live count of cold
+    subprocesses consuming from the work queue
+  - `uttera_stt_cold_workers_loading` — Gauge, cold subprocesses
+    currently in their spawn/load phase
+  - `uttera_stt_cold_worker_pool_size_cap` — Gauge, `COLD_POOL_SIZE`
+  - `uttera_stt_cold_workers_spawned_total` — Counter, monotonic,
+    increments on every successful cold subprocess boot
+  - `uttera_stt_cold_worker_ema_start_seconds` — Gauge, rolling EMA
+    of cold worker boot time in seconds
+  - `uttera_stt_work_queue_depth` — Gauge
+  - `uttera_stt_work_queue_audio_seconds` — Gauge, for drain-time
+    estimate
+  - `uttera_stt_load_score` — Gauge in `[0.0, 1.0]`, saturation
+    signal the gatekeeper's router already uses
+  - `uttera_stt_hot_ema_sps` — Gauge, rolling EMA of hot-lane
+    seconds-of-audio-per-second-of-wall-time
+  - `uttera_stt_vram_free_gb` — Gauge
+  - `uttera_stt_vram_per_cold_worker_gb` — Gauge, rolling EMA
+- **Inference-duration histogram** gains lane-tagged ops:
+  - `op="whisper_transcribe_hot"` — served by the always-resident
+    hot worker
+  - `op="whisper_transcribe_cold"` — served by a cold-pool
+    subprocess
+  - `op="libretranslate"` — LibreTranslate HTTP round-trip
+
+### Instrumentation notes
+
+- The two HTTP endpoints (`/v1/audio/transcriptions`,
+  `/v1/audio/translations`) are the only tick sites for the
+  request-shape counters. Lane-specific bookkeeping
+  (`requests_by_route_total`, `audio_seconds_total{route}`, the
+  lane-tagged inference histogram) uses `item.route` after the
+  future resolves — the same value the server already emits in the
+  `X-Route` response header, so metric-side and client-side see
+  consistent lane labels.
+- All the live gauges (cold workers active/loading, queue depth,
+  VRAM, load score, EMAs) are refreshed on every `/metrics` scrape
+  from the existing internal state — no new state-change hooks
+  across the codebase, keeping the patch lean and the single
+  source of truth intact.
+- `cold_workers_spawned_total` is incremented at exactly one place:
+  the pool-manager spawn site, right after the new task is added
+  to `_pool_worker_tasks`. The idle-exit path doesn't tick a
+  corresponding counter because a healthy cold worker cycle is
+  inferrable from `spawned_total - active - loading` anyway.
+
+### Changed
+
+- **New runtime dep**: `prometheus-client>=0.20.0`.
+- **`SERVER_VERSION` bumped to `2.4.0`.**
+
+### Not changed
+
+- `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/models`,
+  `/health` behave identically to v2.3.0. The `/health` body still
+  reports the full `smart_routing` block for callers that have it
+  hardcoded; the Prometheus counters are the new canonical
+  observability path.
+
 ## [2.3.0] - 2026-04-18
 
 ### Changed

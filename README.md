@@ -352,6 +352,50 @@ docker compose down
 
 The model is persisted in `assets/models/whisper/` (host volume), so it only downloads once.
 
+## 📊 Observability (`/metrics`)
+
+`GET /metrics` returns Prometheus-format metrics for direct scraping
+by Prometheus, Telegraf's `inputs.prometheus` plugin, or any other
+OpenMetrics-compatible consumer. Metrics share the `uttera_stt_*`
+namespace with the sibling `uttera-stt-vllm` backend (same names
+and label shapes for the common series — the `engine` label in
+`uttera_stt_build_info` differentiates the variant), plus this
+server's additional hot/cold pool telemetry.
+
+```toml
+[[inputs.prometheus]]
+  urls = ["http://stt-host:9005/metrics"]
+  interval = "15s"
+```
+
+Key series:
+
+| Metric | Type | Use |
+|---|---|---|
+| `uttera_stt_requests_total{endpoint,method,status}` | Counter | Per-endpoint request rate + status mix |
+| `uttera_stt_request_duration_seconds{endpoint,method}` | Histogram | HTTP p50/p95/p99 (total RTT) |
+| `uttera_stt_inflight_requests` | Gauge | Live load (hot + cold combined) |
+| `uttera_stt_requests_by_route_total{route}` | Counter | Lane split — `HOT` / `COLD-POOL` / `COLD-POOL>HOT` |
+| `uttera_stt_transcriptions_total{response_format}` | Counter | Traffic mix across the five response formats |
+| `uttera_stt_translations_total{mode,response_format}` | Counter | Translation path breakdown |
+| `uttera_stt_audio_seconds_total{endpoint,route}` | Counter | Audio processed, lane-tagged — billing / throughput proxy |
+| `uttera_stt_inference_duration_seconds{op}` | Histogram | Lane-tagged model latency: `whisper_transcribe_hot` / `whisper_transcribe_cold` / `libretranslate` |
+| `uttera_stt_cold_workers_active` | Gauge | Live cold subprocesses |
+| `uttera_stt_cold_workers_loading` | Gauge | Cold subprocesses booting |
+| `uttera_stt_cold_worker_pool_size_cap` | Gauge | `COLD_POOL_SIZE` |
+| `uttera_stt_cold_workers_spawned_total` | Counter | Monotonic spawn count (for cold-worker-churn dashboards) |
+| `uttera_stt_cold_worker_ema_start_seconds` | Gauge | Rolling EMA of cold-worker boot time |
+| `uttera_stt_work_queue_depth` | Gauge | Items queued |
+| `uttera_stt_work_queue_audio_seconds` | Gauge | Audio queued (for drain-time estimate) |
+| `uttera_stt_load_score` | Gauge | Saturation signal `[0.0, 1.0]` |
+| `uttera_stt_hot_ema_sps` | Gauge | Hot-lane throughput EMA |
+| `uttera_stt_vram_free_gb` | Gauge | GPU memory headroom |
+| `uttera_stt_vram_per_cold_worker_gb` | Gauge | Rolling EMA of VRAM per cold subprocess |
+| `uttera_stt_engine_ready` | Gauge | 1 if hot worker loaded |
+| `uttera_stt_libretranslate_configured` | Gauge | 1 if `LIBRETRANSLATE_URL` was set at startup |
+| `uttera_stt_errors_total{type}` | Counter | Typed errors (`decode` / `validation` / `model` / `libretranslate`) |
+| `uttera_stt_build_info{version,engine,model}` | Gauge | Version + engine + model in the field (value always `1`) |
+
 ## 🔒 Security & Network Note
 By default, the server binds to **`127.0.0.1`** on port **`9005`**.
 - To allow external network access, change `--host` to `0.0.0.0`.

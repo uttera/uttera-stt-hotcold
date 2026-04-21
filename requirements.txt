@@ -10,3 +10,8 @@ redis[asyncio]>=5.0.0
 # Used to call LibreTranslate from /v1/audio/translations when
 # LIBRETRANSLATE_URL is set. See main_stt.py, _libretranslate().
 httpx>=0.27.0
+
+# Prometheus /metrics endpoint — uses the default global registry.
+# Scrape with Telegraf's inputs.prometheus, Prometheus itself, or any
+# OpenMetrics-compatible consumer.
+prometheus-client>=0.20.0

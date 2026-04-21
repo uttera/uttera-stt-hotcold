@@ -11,11 +11,23 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-hotcold
-# Version: 2.3.0
+# Version: 2.4.0
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 2.4.0 (2026-04-21): Prometheus /metrics endpoint. Exposes the
+#   shared uttera_stt_* HTTP + request-shape metrics (same labels as
+#   uttera-stt-vllm v1.4.0), plus this server's hot/cold-specific
+#   telemetry: requests_by_route_total{route}, cold_workers_active,
+#   cold_workers_loading, cold_workers_spawned_total,
+#   cold_worker_ema_start_seconds, work_queue_depth,
+#   work_queue_audio_seconds, load_score, vram_free_gb,
+#   vram_per_cold_worker_gb. Inference duration histogram gets
+#   lane-tagged ops: whisper_transcribe_hot vs
+#   whisper_transcribe_cold. Additive — all existing endpoints
+#   unchanged. Scrape with Telegraf's inputs.prometheus or any
+#   OpenMetrics consumer.
 # - 2.3.0 (2026-04-18): Default port migrated from 5000 → 9005. The
 #   OpenAI spec does not mandate a port for self-hosted compatible
 #   servers; we formalise 9005 as the canonical Uttera-stack port for
@@ -199,6 +211,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Optional, Set
@@ -216,7 +236,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "2.3.0"
+SERVER_VERSION = "2.4.0"
 
 # Valid response formats per OpenAI spec
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "vtt", "verbose_json"}
@@ -380,6 +400,47 @@ if _cors_origins_env:
         expose_headers=["X-Route", "X-Translation-Mode"],
     )
 
+
+# Prometheus middleware — tracks every HTTP request generically.
+# Endpoint-specific and lane-specific labels go in the endpoint
+# handlers.
+
+class _PrometheusMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        method = request.method
+        if path == "/metrics":
+            return await call_next(request)
+        endpoint = path if path in _KNOWN_ENDPOINTS else "other"
+        t0 = time.monotonic()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            elapsed = time.monotonic() - t0
+            _HTTP_REQUESTS_TOTAL.labels(
+                endpoint=endpoint, method=method, status=str(status)
+            ).inc()
+            _HTTP_REQUEST_DURATION.labels(
+                endpoint=endpoint, method=method
+            ).observe(elapsed)
+
+app.add_middleware(_PrometheusMiddleware)
+
+# Static gauges — set once at module import time.
+_BUILD_INFO.labels(
+    version=SERVER_VERSION,
+    engine="whisper-hotcold",
+    model=os.environ.get("WHISPER_MODEL", "medium"),
+).set(1)
+_LIBRETRANSLATE_CONFIGURED_GAUGE.set(
+    1 if os.environ.get("LIBRETRANSLATE_URL", "").strip() else 0
+)
+_COLD_WORKER_POOL_CAP_GAUGE.set(COLD_POOL_SIZE)
+
+
 # -------------------------------
 # 2. Model Loading
 # -------------------------------
@@ -436,6 +497,143 @@ _pool_worker_tasks: Set[asyncio.Task] = set()
 
 # Redis client (None when REDIS_URL is not configured).
 _redis: Optional[aioredis.Redis] = None
+
+
+# -------------------------------
+# Prometheus metrics
+# -------------------------------
+#
+# Naming is shared with uttera-stt-vllm (`uttera_stt_*`) so a dashboard
+# that aggregates across both backends can use the same queries. The
+# engine label in uttera_stt_build_info differentiates the variant
+# ("whisper-hotcold" here, "vllm" on the sibling). Hot/cold-specific
+# series (queue depth, cold worker counts, lane routing, VRAM) are
+# additive — they only exist on this server.
+
+# --- HTTP-level (shared shape with sibling vllm backend) ---
+_HTTP_REQUESTS_TOTAL = Counter(
+    "uttera_stt_requests_total",
+    "HTTP requests by endpoint, method and status code",
+    ["endpoint", "method", "status"],
+)
+_HTTP_REQUEST_DURATION = Histogram(
+    "uttera_stt_request_duration_seconds",
+    "HTTP request wall-clock duration in seconds",
+    ["endpoint", "method"],
+    buckets=(0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+)
+_INFLIGHT_GAUGE = Gauge(
+    "uttera_stt_inflight_requests",
+    "Requests currently being processed (hot + cold lanes combined)",
+)
+_ENGINE_READY_GAUGE = Gauge(
+    "uttera_stt_engine_ready",
+    "1 if the hot worker's Whisper model is loaded and ready, 0 otherwise",
+)
+_LIBRETRANSLATE_CONFIGURED_GAUGE = Gauge(
+    "uttera_stt_libretranslate_configured",
+    "1 if LIBRETRANSLATE_URL is set and translations go through LibreTranslate",
+)
+
+# --- Shared request-shape counters ---
+_TRANSCRIPTIONS_TOTAL = Counter(
+    "uttera_stt_transcriptions_total",
+    "Transcription requests broken down by requested response_format",
+    ["response_format"],
+)
+_TRANSLATIONS_TOTAL = Counter(
+    "uttera_stt_translations_total",
+    "Translation requests broken down by post-processing mode and response_format",
+    ["mode", "response_format"],
+)
+_AUDIO_SECONDS_TOTAL = Counter(
+    "uttera_stt_audio_seconds_total",
+    "Total seconds of audio successfully processed (billing / throughput proxy)",
+    ["endpoint", "route"],
+)
+
+# --- Inference-duration histogram (per-op) ---
+# op values on hot/cold:
+#   whisper_transcribe_hot   — the always-resident hot worker handled it
+#   whisper_transcribe_cold  — a cold-pool subprocess handled it
+#   libretranslate           — LibreTranslate HTTP round-trip
+_INFERENCE_DURATION = Histogram(
+    "uttera_stt_inference_duration_seconds",
+    "Per-call inference latency in seconds, by op",
+    ["op"],
+    buckets=(0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
+
+_ERRORS_TOTAL = Counter(
+    "uttera_stt_errors_total",
+    "Errors by type",
+    ["type"],   # decode | validation | model | libretranslate | timeout
+)
+
+_BUILD_INFO = Gauge(
+    "uttera_stt_build_info",
+    "Build metadata (label values carry version, engine and served model id)",
+    ["version", "engine", "model"],
+)
+
+# --- Hot/cold pool specific (additive vs the vllm sibling) ---
+_REQUESTS_BY_ROUTE_TOTAL = Counter(
+    "uttera_stt_requests_by_route_total",
+    "Successful requests broken down by which lane ultimately served them",
+    ["route"],   # HOT | COLD-POOL | COLD-POOL>HOT
+)
+_COLD_WORKERS_ACTIVE_GAUGE = Gauge(
+    "uttera_stt_cold_workers_active",
+    "Cold worker subprocesses currently alive and consuming from the work queue",
+)
+_COLD_WORKERS_LOADING_GAUGE = Gauge(
+    "uttera_stt_cold_workers_loading",
+    "Cold worker subprocesses currently in their spawn/load phase",
+)
+_COLD_WORKER_POOL_CAP_GAUGE = Gauge(
+    "uttera_stt_cold_worker_pool_size_cap",
+    "Configured COLD_POOL_SIZE — the ceiling on active + loading cold workers",
+)
+_COLD_WORKERS_SPAWNED_TOTAL = Counter(
+    "uttera_stt_cold_workers_spawned_total",
+    "Total cold worker subprocesses ever successfully spawned (monotonic)",
+)
+_COLD_EMA_START_GAUGE = Gauge(
+    "uttera_stt_cold_worker_ema_start_seconds",
+    "Rolling EMA of cold worker boot time (seconds from spawn to ready-to-serve)",
+)
+_WORK_QUEUE_DEPTH_GAUGE = Gauge(
+    "uttera_stt_work_queue_depth",
+    "Items currently queued waiting for a hot or cold worker",
+)
+_WORK_QUEUE_AUDIO_SECONDS_GAUGE = Gauge(
+    "uttera_stt_work_queue_audio_seconds",
+    "Sum of audio durations waiting in the work queue (for drain-estimate latency)",
+)
+_LOAD_SCORE_GAUGE = Gauge(
+    "uttera_stt_load_score",
+    "Current load score in [0.0, 1.0]; 1.0 means the queue would take ROUTING_DRAIN_CAP_SECONDS or more to drain",
+)
+_HOT_EMA_SPS_GAUGE = Gauge(
+    "uttera_stt_hot_ema_sps",
+    "Rolling EMA of the hot worker's seconds-of-audio per second of wall-time (throughput proxy)",
+)
+_VRAM_FREE_GB_GAUGE = Gauge(
+    "uttera_stt_vram_free_gb",
+    "Free VRAM on the serving GPU in GB",
+)
+_VRAM_PER_COLD_WORKER_GB_GAUGE = Gauge(
+    "uttera_stt_vram_per_cold_worker_gb",
+    "Rolling EMA of VRAM consumed by each cold worker subprocess, in GB",
+)
+
+_KNOWN_ENDPOINTS = {
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/models",
+    "/health",
+    "/metrics",
+}
 
 
 async def _publish_to_redis(load_score: float, accepts: bool) -> None:
@@ -909,6 +1107,7 @@ async def _cold_pool_manager() -> None:
                 task = asyncio.create_task(_pool_worker_loop(worker, worker_idle_timeout))
                 _pool_worker_tasks.add(task)
                 task.add_done_callback(_pool_worker_tasks.discard)
+                _COLD_WORKERS_SPAWNED_TOTAL.inc()
                 print(
                     f"--- POOL MGR: pool worker ready, total_active={len(_pool_worker_tasks)}"
                     f", idle_timeout={worker_idle_timeout:.0f}s ---",
@@ -982,6 +1181,52 @@ async def health_check():
         },
         "smart_routing": routing_stats,
     }
+
+
+def _refresh_gauges_from_state() -> None:
+    """Snapshot the live routing state into Prometheus gauges.
+
+    Called on every `/metrics` scrape so the numbers are always
+    current without hooking every state-change site. Mirrors what
+    `health_check()` computes.
+    """
+    _ENGINE_READY_GAUGE.set(1 if whisper_model is not None and hot_worker_error is None else 0)
+    _COLD_WORKERS_ACTIVE_GAUGE.set(len(_pool_worker_tasks))
+    _COLD_WORKERS_LOADING_GAUGE.set(_cold_workers_in_flight)
+    _WORK_QUEUE_DEPTH_GAUGE.set(_work_queue.qsize() if _work_queue is not None else 0)
+    _WORK_QUEUE_AUDIO_SECONDS_GAUGE.set(_work_queue_audio_seconds)
+    if _hot_ema_sps is not None:
+        _HOT_EMA_SPS_GAUGE.set(_hot_ema_sps)
+        drain = _work_queue_audio_seconds * _hot_ema_sps
+        _LOAD_SCORE_GAUGE.set(min(drain / ROUTING_DRAIN_CAP_SECONDS, 1.0))
+    else:
+        _LOAD_SCORE_GAUGE.set(min(_work_queue_audio_seconds / ROUTING_DRAIN_CAP_SECONDS, 1.0))
+    if _cold_ema_start_stt is not None:
+        _COLD_EMA_START_GAUGE.set(_cold_ema_start_stt)
+    _free = _free_vram_gb()
+    if _free is not None:
+        _VRAM_FREE_GB_GAUGE.set(_free)
+    _VRAM_PER_COLD_WORKER_GB_GAUGE.set(_vram_per_cold_worker())
+    # _INFLIGHT_GAUGE is not refreshed here — it's maintained
+    # precisely by the transcription/translation endpoint handlers.
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus-format scrape endpoint.
+
+    Exposes both the generic HTTP-level metrics (tracked via the
+    middleware) and this server's hot/cold-specific pool telemetry
+    (cold workers active/loading/spawned, queue depth, VRAM, load
+    score). Cardinality is bounded by design — no per-request-id
+    labels, no language labels, no voice labels.
+
+    Scrape with Telegraf's `inputs.prometheus`, Prometheus itself,
+    or any OpenMetrics-compatible consumer.
+    """
+    _refresh_gauges_from_state()
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 def _validate_common_params(response_format: str, temperature: float) -> None:
     """Validate OpenAI-compat request params before doing any work. Raises HTTPException."""
@@ -1084,6 +1329,9 @@ async def create_transcription(
     if whisper_model is None:
         raise HTTPException(status_code=500, detail="Model not loaded.")
     _validate_common_params(response_format, temperature)
+    _TRANSCRIPTIONS_TOTAL.labels(response_format=response_format).inc()
+    _INFLIGHT_GAUGE.inc()
+    req_t0 = time.monotonic()
     try:
         contents = await file.read()
         try:
@@ -1091,6 +1339,7 @@ async def create_transcription(
         except Exception as e:
             # ffmpeg / libsndfile failed to decode — client sent a non-audio file
             # or an unsupported codec. 400 is the right answer.
+            _ERRORS_TOTAL.labels(type="decode").inc()
             raise HTTPException(
                 status_code=400,
                 detail=f"Failed to decode audio: {type(e).__name__}: {str(e)[:200]}",
@@ -1113,6 +1362,14 @@ async def create_transcription(
 
         res = await future
         route = item.route
+        # Lane-tagged bookkeeping: which lane served this, how much audio
+        # it processed, and how long whisper took from queue-dispatch.
+        _REQUESTS_BY_ROUTE_TOTAL.labels(route=route).inc()
+        _AUDIO_SECONDS_TOTAL.labels(
+            endpoint="/v1/audio/transcriptions", route=route
+        ).inc(audio_dur)
+        op = "whisper_transcribe_cold" if route in ("COLD-POOL",) else "whisper_transcribe_hot"
+        _INFERENCE_DURATION.labels(op=op).observe(time.monotonic() - req_t0)
         return _render_response(res, response_format, route)
     except HTTPException:
         raise
@@ -1120,12 +1377,14 @@ async def create_transcription(
         # Whisper raises ValueError for "Unsupported language: XX" and similar.
         # Surface the actual message instead of a generic 500.
         msg = str(e)
+        _ERRORS_TOTAL.labels(type="validation").inc()
         print(f"ERROR in create_transcription (ValueError): {msg}", flush=True)
         raise HTTPException(status_code=400, detail=msg)
     except Exception as e:
         # Re-raise known HTTP errors, but surface ValueError from the worker loop too.
         msg = str(e)
         if isinstance(e, ValueError) or "Unsupported language" in msg or ("language" in msg.lower() and "not supported" in msg.lower()):
+            _ERRORS_TOTAL.labels(type="validation").inc()
             print(f"ERROR in create_transcription (language): {msg}", flush=True)
             raise HTTPException(status_code=400, detail=msg)
         # Whisper's "Failed to load audio: ..." comes from ffmpeg choking on
@@ -1133,14 +1392,17 @@ async def create_transcription(
         # fault. Truncate the ffmpeg output since it includes the full build
         # banner on every failure.
         if "Failed to load audio" in msg:
+            _ERRORS_TOTAL.labels(type="decode").inc()
             print(f"ERROR in create_transcription (decode): {msg[:200]}", flush=True)
             raise HTTPException(
                 status_code=400,
                 detail="Failed to decode audio body — not a valid audio stream or unsupported codec.",
             )
+        _ERRORS_TOTAL.labels(type="model").inc()
         print(f"ERROR in create_transcription: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Transcription failed. Check server logs.")
     finally:
+        _INFLIGHT_GAUGE.dec()
         await file.close()
 
 # Whisper emits ISO-639-1 language codes (e.g. "zh"); LibreTranslate
@@ -1205,12 +1467,18 @@ async def create_translation(
         raise HTTPException(status_code=500, detail="Model not loaded.")
     _validate_common_params(response_format, temperature)
     target_lang = (to_language or "en").lower()
+    _mode_label = "libretranslate" if LIBRETRANSLATE_URL else "native"
+    _TRANSLATIONS_TOTAL.labels(mode=_mode_label, response_format=response_format).inc()
+    _INFLIGHT_GAUGE.inc()
+    whisper_t0 = time.monotonic()
 
     # Contract gate: in legacy Whisper-native mode (no LibreTranslate configured)
     # only target=en is actually supported. Silently falling back to English
     # when the caller explicitly asked for another language is a contract
     # violation, so reject with 400 instead.
     if not LIBRETRANSLATE_URL and target_lang != "en":
+        _ERRORS_TOTAL.labels(type="validation").inc()
+        _INFLIGHT_GAUGE.dec()
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1226,6 +1494,7 @@ async def create_translation(
         try:
             audio_dur = _get_audio_duration(contents)
         except Exception as e:
+            _ERRORS_TOTAL.labels(type="decode").inc()
             raise HTTPException(
                 status_code=400,
                 detail=f"Failed to decode audio: {type(e).__name__}: {str(e)[:200]}",
@@ -1252,6 +1521,13 @@ async def create_translation(
 
         res = await future
         route = item.route
+        # Lane-tagged bookkeeping (shared with /v1/audio/transcriptions).
+        _REQUESTS_BY_ROUTE_TOTAL.labels(route=route).inc()
+        _AUDIO_SECONDS_TOTAL.labels(
+            endpoint="/v1/audio/translations", route=route
+        ).inc(audio_dur)
+        _op_whisper = "whisper_transcribe_cold" if route in ("COLD-POOL",) else "whisper_transcribe_hot"
+        _INFERENCE_DURATION.labels(op=_op_whisper).observe(time.monotonic() - whisper_t0)
 
         # Legacy path: no LibreTranslate, return Whisper native translation.
         if not LIBRETRANSLATE_URL:
@@ -1271,8 +1547,10 @@ async def create_translation(
             out_text = text  # no-op shortcut
         else:
             try:
-                out_text = await _libretranslate(text, source_lang, target_lang)
+                with _INFERENCE_DURATION.labels(op="libretranslate").time():
+                    out_text = await _libretranslate(text, source_lang, target_lang)
             except Exception as e:
+                _ERRORS_TOTAL.labels(type="libretranslate").inc()
                 print(f"ERROR in _libretranslate: {e}", flush=True)
                 raise HTTPException(
                     status_code=502,
@@ -1291,22 +1569,27 @@ async def create_translation(
         raise
     except ValueError as e:
         msg = str(e)
+        _ERRORS_TOTAL.labels(type="validation").inc()
         print(f"ERROR in create_translation (ValueError): {msg}", flush=True)
         raise HTTPException(status_code=400, detail=msg)
     except Exception as e:
         msg = str(e)
         if "Unsupported language" in msg or ("language" in msg.lower() and "not supported" in msg.lower()):
+            _ERRORS_TOTAL.labels(type="validation").inc()
             print(f"ERROR in create_translation (language): {msg}", flush=True)
             raise HTTPException(status_code=400, detail=msg)
         if "Failed to load audio" in msg:
+            _ERRORS_TOTAL.labels(type="decode").inc()
             print(f"ERROR in create_translation (decode): {msg[:200]}", flush=True)
             raise HTTPException(
                 status_code=400,
                 detail="Failed to decode audio body — not a valid audio stream or unsupported codec.",
             )
+        _ERRORS_TOTAL.labels(type="model").inc()
         print(f"ERROR in create_translation: {e}", flush=True)
         raise HTTPException(status_code=500, detail="Translation failed. Check server logs.")
     finally:
+        _INFLIGHT_GAUGE.dec()
         await file.close()
 
 if __name__ == "__main__":
