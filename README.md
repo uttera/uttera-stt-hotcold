@@ -63,15 +63,69 @@ test-clean and an internal Spanish WAV corpus).
 
 ## 🚀 Key Features
 
-- **Hybrid Concurrency:**
-  - **Hot Worker:** Keeps a Whisper model resident in VRAM for sub-second (~0.2s) inference.
-  - **Cold Workers:** Spawns on-demand subprocesses when the GPU is busy, ensuring long audio files don't block quick voice commands.
-- **GPU Accelerated:** Native support for NVIDIA CUDA, ensuring ultra-fast inference.
-- **OpenAI Compatible:** Implements the standard OpenAI STT API (`/v1/audio/transcriptions`, `/v1/audio/translations`). Includes `GET /v1/models` for client autodiscovery.
-- **Translation (v2.1.0+):** `POST /v1/audio/translations` supports arbitrary target languages via a Whisper-transcribe → LibreTranslate pipeline when `LIBRETRANSLATE_URL` is set (request field `to_language`, default `"en"`). Without `LIBRETRANSLATE_URL`, falls back to Whisper's native translate task (English only; works poorly on models like `turbo` that were not trained for it).
-- **Multilingual:** Supports all languages covered by Whisper (99 languages). Auto-detects language if not specified.
-- **Health Endpoint:** `GET /health` exposes server version, model name, and hot worker status for proxies and Docker healthchecks.
-- **Privacy First:** 100% local execution. Your audio never leaves your infrastructure.
+*Concurrency and engine*
+- **Hybrid hot/cold pool:**
+  - **Hot worker:** Whisper resident in VRAM for sub-second (~0.2 s)
+    inference on short clips.
+  - **Cold workers:** on-demand subprocesses spawned on the GPU when
+    the hot lane is busy, so long audio files don't block quick voice
+    commands. Drains idle after `COLD_WORKER_IDLE_TIMEOUT`.
+- **GPU accelerated** via NVIDIA CUDA. fp16 + fp32-LayerNorm by
+  default (`WHISPER_FP16=1`) — halves VRAM with no quality loss.
+
+*OpenAI-compatible API*
+- Standard endpoints: `POST /v1/audio/transcriptions`,
+  `POST /v1/audio/translations`.
+- `GET /v1/models` for client autodiscovery (reports `whisper-1`,
+  `owned_by: uttera`).
+- **All five OpenAI `response_format` values really supported**
+  (v2.2.0) — `json`, `text`, `verbose_json`, `srt`, `vtt`. Previously
+  `srt` / `vtt` / `verbose_json` silently collapsed to the compact
+  JSON form.
+
+*Translation*
+- **`POST /v1/audio/translations`** with `to_language` (default `en`).
+  With `LIBRETRANSLATE_URL` set: Whisper-transcribe → LibreTranslate
+  pipeline to any target language. Without: Whisper native `translate`
+  (English only; poor on `turbo`-class models).
+- `to_language != "en"` without `LIBRETRANSLATE_URL` → **HTTP 400**
+  with the missing-env-var name (previously a silent fallback to
+  English — a contract violation).
+- **`X-Translation-Mode: libretranslate`** response header whenever
+  the LibreTranslate path runs, so clients and observability tooling
+  can tell which engine handled the call.
+
+*Validation and observability*
+- Strict validation on every knob — out-of-range returns HTTP 422 or
+  HTTP 400 with a useful detail body:
+  - `response_format` must be one of `json|text|verbose_json|srt|vtt`.
+  - `temperature` ∈ `[0.0, 1.0]` (OpenAI spec).
+  - Undecodeable / non-audio file bodies → HTTP 400 with the typed
+    decode error (was HTTP 500 before v2.2.0).
+  - Unsupported Whisper language codes → HTTP 400 with the message
+    (was generic HTTP 500 before v2.2.0).
+- **`X-Route`** response header — `HOT` / `COLD-POOL` / `COLD-POOL>HOT`
+  — tells the client which lane handled the request, exposed to
+  browsers via CORS when CORS is enabled.
+- Multilingual: 99 languages covered by Whisper. Auto-detects if
+  `language` is omitted.
+
+*Operations*
+- `GET /health` **and `HEAD /health`** (v2.2.0) expose version,
+  model, worker status, queue depth, VRAM — one struct for both
+  proxies and Docker healthchecks.
+- Opt-in **`CORSMiddleware`** via `CORS_ALLOW_ORIGINS` env var
+  (disabled by default — API-first deployments don't need it).
+  Exposes `X-Route` and `X-Translation-Mode` to browser clients.
+- Canonical Uttera-stack port **`9005`** (STT family). TTS family
+  uses `9004`. Swapping `hotcold ↔ vllm` is a backend change, not
+  a port change.
+- Optional Redis self-registration (`REDIS_URL`) for upstream router
+  discovery — same protocol as the sibling `uttera-stt-vllm` and the
+  TTS servers.
+
+*Privacy*
+- 100% local execution. Your audio never leaves your infrastructure.
 
 ## 🧠 Available Models
 
@@ -139,10 +193,14 @@ The server listens on port `9005` by default. Ensure the user has permissions to
 
 | Method | Path | Description |
 | :--- | :--- | :--- |
-| `GET` | `/health` | Server liveness, version, and hot worker status. |
-| `GET` | `/v1/models` | OpenAI-compatible model list (`whisper-1`). |
-| `POST` | `/v1/audio/transcriptions` | Transcribe audio to text (Hot or Cold Lane). |
+| `GET` / `HEAD` | `/health` | Server liveness, version, model, worker status, queue, VRAM. |
+| `GET` | `/v1/models` | OpenAI-compatible model list (`whisper-1`, `owned_by: uttera`). |
+| `POST` | `/v1/audio/transcriptions` | Transcribe audio to text (Hot or Cold Lane). Supports `json` / `text` / `verbose_json` / `srt` / `vtt` response formats. |
 | `POST` | `/v1/audio/translations` | Transcribe + translate to `to_language` (default `en`). With `LIBRETRANSLATE_URL`: any target language. Without: English only (Whisper native). |
+
+See [API.md](API.md) for full request/response schemas, validation
+ranges, `X-Route` / `X-Translation-Mode` semantics, and the error
+taxonomy (400 / 422 / 502).
 
 ## 🛠 Execution
 

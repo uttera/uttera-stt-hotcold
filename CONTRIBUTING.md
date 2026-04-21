@@ -19,7 +19,8 @@ Before opening a bug report:
 1. Search [existing issues](../../issues) to see if someone has already
    reported the same problem.
 2. If not, open a new issue using the "Bug report" template. Include:
-   - Exact server version (`curl /health | jq .server_version`)
+   - Exact server version (`curl http://host:9005/health | jq .version`)
+   - Whisper model loaded (`curl http://host:9005/health | jq .model`)
    - Python version, GPU model, driver version
    - Steps to reproduce
    - Expected vs actual behavior
