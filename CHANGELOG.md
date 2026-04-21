@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-04-21
+
+### Fixed
+
+- Module-load-time `NameError` in the 2.4.0 Prometheus
+  instrumentation: the static gauge setters
+  (`_BUILD_INFO.labels(...).set(1)`,
+  `_LIBRETRANSLATE_CONFIGURED_GAUGE.set(...)`,
+  `_COLD_WORKER_POOL_CAP_GAUGE.set(COLD_POOL_SIZE)`) were placed
+  immediately after `app.add_middleware(...)` but *before* the
+  `Counter`/`Gauge`/`Histogram` definitions, so the server crashed
+  during `import main_stt`. Moved those three calls to run after the
+  metric-definition block. No behavioural change at runtime; 2.4.0
+  never booted.
+
 ## [2.4.0] - 2026-04-21
 
 Prometheus `/metrics` endpoint. Additive only — all existing

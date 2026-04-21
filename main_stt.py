@@ -11,11 +11,16 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-hotcold
-# Version: 2.4.0
+# Version: 2.4.1
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 2.4.1 (2026-04-21): Fix module-load-time NameError introduced in
+#   2.4.0: the static gauge setters (_BUILD_INFO.labels(...).set(1),
+#   _LIBRETRANSLATE_CONFIGURED_GAUGE, _COLD_WORKER_POOL_CAP_GAUGE) were
+#   placed above the metric definitions and crashed at import. Moved
+#   them to run after the metric-definition block. 2.4.0 never booted.
 # - 2.4.0 (2026-04-21): Prometheus /metrics endpoint. Exposes the
 #   shared uttera_stt_* HTTP + request-shape metrics (same labels as
 #   uttera-stt-vllm v1.4.0), plus this server's hot/cold-specific
@@ -236,7 +241,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "2.4.0"
+SERVER_VERSION = "2.4.1"
 
 # Valid response formats per OpenAI spec
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "vtt", "verbose_json"}
@@ -429,17 +434,6 @@ class _PrometheusMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(_PrometheusMiddleware)
 
-# Static gauges — set once at module import time.
-_BUILD_INFO.labels(
-    version=SERVER_VERSION,
-    engine="whisper-hotcold",
-    model=os.environ.get("WHISPER_MODEL", "medium"),
-).set(1)
-_LIBRETRANSLATE_CONFIGURED_GAUGE.set(
-    1 if os.environ.get("LIBRETRANSLATE_URL", "").strip() else 0
-)
-_COLD_WORKER_POOL_CAP_GAUGE.set(COLD_POOL_SIZE)
-
 
 # -------------------------------
 # 2. Model Loading
@@ -626,6 +620,18 @@ _VRAM_PER_COLD_WORKER_GB_GAUGE = Gauge(
     "uttera_stt_vram_per_cold_worker_gb",
     "Rolling EMA of VRAM consumed by each cold worker subprocess, in GB",
 )
+
+# Static gauges — set once at module import time, after all metric
+# definitions above have registered their series.
+_BUILD_INFO.labels(
+    version=SERVER_VERSION,
+    engine="whisper-hotcold",
+    model=os.environ.get("WHISPER_MODEL", "medium"),
+).set(1)
+_LIBRETRANSLATE_CONFIGURED_GAUGE.set(
+    1 if os.environ.get("LIBRETRANSLATE_URL", "").strip() else 0
+)
+_COLD_WORKER_POOL_CAP_GAUGE.set(COLD_POOL_SIZE)
 
 _KNOWN_ENDPOINTS = {
     "/v1/audio/transcriptions",
