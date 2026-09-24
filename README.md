@@ -117,12 +117,21 @@ test-clean and an internal Spanish WAV corpus).
 - Opt-in **`CORSMiddleware`** via `CORS_ALLOW_ORIGINS` env var
   (disabled by default — API-first deployments don't need it).
   Exposes `X-Route` and `X-Translation-Mode` to browser clients.
-- Canonical Uttera-stack port **`9005`** (STT family). TTS family
-  uses `9004`. Swapping `hotcold ↔ vllm` is a backend change, not
-  a port change.
-- Optional Redis self-registration (`REDIS_URL`) for upstream router
-  discovery — same protocol as the sibling `uttera-stt-vllm` and the
-  TTS servers.
+- Default port **`9005`**, shared with the sibling `uttera-stt-vllm` so
+  the two STT backends are drop-in swappable behind a reverse proxy.
+
+*Robustness (v2.5.0)*
+- **Optional frozen-model mode** — set `UTTERA_OFFLINE=1` to pin the engine
+  to its local cache so a validated model can't silently re-download or
+  change after a reboot. Online by default so a fresh install can fetch.
+- **Voice-activity gate** — returns an empty transcription for clips
+  with no speech, so Whisper doesn't hallucinate on silence. Disables
+  itself if `silero-vad` isn't installed.
+- **Engine circuit breaker + recovery self-probe** — repeated engine
+  failures flip `/health` to `503`; an in-process probe auto-clears it
+  when the engine recovers, no restart needed.
+- **Correct HTTP status codes** — oversized upload or over-long text →
+  `413`, GPU out-of-memory → `503`, malformed JSON → `400`.
 
 *Privacy*
 - 100% local execution. Your audio never leaves your infrastructure.
@@ -230,11 +239,15 @@ Copy `.env.example` to `.env` and adjust as needed. All variables are optional.
 | `COLD_WORKER_IDLE_STAGGER` | `10` | Stagger per worker slot to avoid mass die-off. |
 | `MIN_COLD_VRAM_GB` | `4.0` | Min free VRAM to spawn a cold worker (0=disable). |
 | `COLD_LANE_TIMEOUT_SECONDS` | `300` | Max seconds to wait for a Cold Lane subprocess before HTTP 500. |
-| `ROUTING_DRAIN_CAP_SECONDS` | `120` | Queue drain time considered 100% load. |
-| `REDIS_URL` | *(empty)* | Redis URL for node self-registration (opt-in). |
-| `NODE_HOST` | `localhost` | Host advertised to Redis for Gatekeeper routing. |
-| `NODE_PORT` | `9005` | Port advertised to Redis for Gatekeeper routing. |
-| `DEBUG` | `false` | Set to `true` to enable worker routing and subprocess traces. |
+| `VAD_ENABLED` | `1` | Voice-activity gate: skip the model on clips with no speech. Set `0` to disable. |
+| `VAD_THRESHOLD` | `0.5` | Silero speech probability above which a window counts as speech. |
+| `VAD_JIT` | *(empty)* | Path to the Silero JIT model. Empty = look inside the installed `silero-vad`. |
+| `VAD_STRIDE` | `4` | Inspect one window out of every N (512-sample windows). |
+| `MAX_FILESIZE_MB` | `250` | Reject a larger upload with HTTP 413 before it reaches the model. |
+| `ENGINE_FAIL_THRESHOLD` | `3` | Consecutive engine (5xx) failures that open the circuit breaker (`/health` → 503). |
+| `ENGINE_PROBE_SECONDS` | `30` | Recovery self-probe interval while the breaker is open. |
+| `UTTERA_OFFLINE` | `0` | Set `1` to pin the engine to the local cache (frozen model) — the server then sets `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` / `MODELSCOPE_OFFLINE` before import. Online by default. |
+| `DEBUG` | `false` | Set to `true` to enable hot/cold worker-lane selection and subprocess traces. |
 | `VENV_PYTHON` | *(auto-detected)* | Path to venv Python. Auto-detected from `venv/bin/python`. |
 
 *See `.env.example` for the full list of variables and their defaults.*
@@ -264,6 +277,18 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now uttera-stt.service
+```
+
+### System Service (system-wide)
+
+For a system-wide install, a ready-made unit ships as
+[`uttera-stt-hotcold.service`](uttera-stt-hotcold.service) (runs as a dedicated
+`uttera` user out of `/opt/uttera-stt-hotcold`):
+
+```bash
+sudo cp uttera-stt-hotcold.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now uttera-stt-hotcold
 ```
 
 ## 🔧 Troubleshooting
@@ -387,7 +412,6 @@ Key series:
 | `uttera_stt_cold_worker_ema_start_seconds` | Gauge | Rolling EMA of cold-worker boot time |
 | `uttera_stt_work_queue_depth` | Gauge | Items queued |
 | `uttera_stt_work_queue_audio_seconds` | Gauge | Audio queued (for drain-time estimate) |
-| `uttera_stt_load_score` | Gauge | Saturation signal `[0.0, 1.0]` |
 | `uttera_stt_hot_ema_sps` | Gauge | Hot-lane throughput EMA |
 | `uttera_stt_vram_free_gb` | Gauge | GPU memory headroom |
 | `uttera_stt_vram_per_cold_worker_gb` | Gauge | Rolling EMA of VRAM per cold subprocess |

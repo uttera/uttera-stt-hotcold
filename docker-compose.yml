@@ -16,9 +16,8 @@ services:
       - COLD_WORKER_IDLE_STAGGER=10
       - COLD_LANE_TIMEOUT_SECONDS=300
       - DEBUG=false
-      # - REDIS_URL=redis://redis:6379
-      # - NODE_HOST=whisper-stt-server
-      # - NODE_PORT=9005
+      # - VAD_ENABLED=1
+      # - MAX_FILESIZE_MB=250
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     devices:

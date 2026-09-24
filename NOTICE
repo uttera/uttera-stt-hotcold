@@ -64,11 +64,12 @@ Uvicorn
   ASGI server used to run this service.
 
 --------------------------------------------------------------------------------
-redis-py (optional, used when REDIS_URL is set)
-  Source:   https://github.com/redis/redis-py
+Silero VAD (optional; used by the voice-activity gate)
+  Source:   https://github.com/snakers4/silero-vad
   License:  MIT
 
-  Used for optional cluster self-registration.
+  Provides the JIT voice-activity model used to skip silent clips. The gate
+  disables itself if the package is not installed.
 
 --------------------------------------------------------------------------------
 Additional transitive dependencies

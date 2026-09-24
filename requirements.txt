@@ -6,10 +6,17 @@ uvicorn>=0.23.0
 pydantic>=2.0
 python-multipart>=0.0.9
 python-dotenv>=1.0.0
-redis[asyncio]>=5.0.0
 # Used to call LibreTranslate from /v1/audio/translations when
-# LIBRETRANSLATE_URL is set. See main_stt.py, _libretranslate().
+# LIBRETRANSLATE_URL is set, and by the in-process recovery self-probe.
+# See main_stt.py, _libretranslate() and _engine_probe_loop().
 httpx>=0.27.0
+
+# Voice-activity gate (VAD) on /v1/audio/transcriptions: skips the model on
+# clips with no speech, which stops Whisper hallucinating text on silence.
+# The JIT model is loaded by hand; onnxruntime is deliberately NOT pulled in.
+# Optional — if absent, the gate disables itself and every clip is transcribed.
+silero-vad>=5.1
+numpy
 
 # Prometheus /metrics endpoint — uses the default global registry.
 # Scrape with Telegraf's inputs.prometheus, Prometheus itself, or any

@@ -93,10 +93,9 @@ servers ship today under that umbrella:
 - **`uttera-tts-vllm`** — TTS sibling of `uttera-stt-vllm`, built on
   `nano-vllm-voxcpm`'s continuous batcher (VoxCPM2-only by design).
 
-All four share a common health-check schema, Redis self-registration
-protocol, `X-Route` response header semantics, and sit behind the
-same [echo-gatekeeper](https://github.com/uttera) for tier gating,
-rate limits, and billing.
+All four share a common OpenAI-compatible surface and health-check
+schema, and each runs standalone — deploy one, or run several behind
+your own reverse proxy or API gateway for keys, quotas, and rate limits.
 
 The original design philosophy, set during the first hot/cold
 experiments, remains unchanged:

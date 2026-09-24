@@ -1,0 +1,33 @@
+# systemd unit: Uttera STT Hot/Cold Server
+#
+# Install (system-wide):
+#   sudo cp uttera-stt-hotcold.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now uttera-stt-hotcold
+#
+# Tweak User, WorkingDirectory, and EnvironmentFile to match your deploy.
+# (A per-user variant with `systemctl --user` is shown in the README.)
+
+[Unit]
+Description=Uttera STT Hot/Cold Server (Whisper, hot/cold worker pool)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uttera
+Group=uttera
+WorkingDirectory=/opt/uttera-stt-hotcold
+EnvironmentFile=-/opt/uttera-stt-hotcold/.env
+ExecStart=/opt/uttera-stt-hotcold/venv/bin/uvicorn main_stt:app --host 0.0.0.0 --port 9005
+Restart=on-failure
+RestartSec=5
+# The hot worker loads the model at startup; give it room on a cold cache.
+TimeoutStartSec=180
+# KillMode=control-group (the default) makes systemd tear down the cold-worker
+# subprocesses along with the main process on stop/restart — no orphans.
+KillMode=control-group
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-09-24
+
+Robustness sweep and standalone. Five additions, all env-gated and safe by
+default. No breaking changes to the request API. `/health` dropped its
+`routing` block, renamed `smart_routing` to `pool`, added
+`consecutive_engine_failures`, and now returns `503` when the engine is not
+ready or the circuit breaker is open.
+
+### Added
+
+- **Optional frozen-model mode.** Set `UTTERA_OFFLINE=1` and the server sets
+  `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` / `MODELSCOPE_OFFLINE` before the
+  ML libraries import, so a validated model never silently re-downloads or
+  changes on a reboot. Online by default (a fresh install can fetch its model).
+- **Voice-activity gate (VAD).** Returns an empty transcription for clips
+  with no speech, which stops Whisper hallucinating text on silence. On any
+  doubt the clip is transcribed. Silero JIT model, on CPU. Env: `VAD_ENABLED`,
+  `VAD_THRESHOLD`, `VAD_JIT`, `VAD_STRIDE`. Needs `silero-vad`; disables
+  itself if absent.
+- **Engine circuit breaker.** `ENGINE_FAIL_THRESHOLD` consecutive engine
+  (5xx) failures flip the server to not-ready so `/health` returns `503`; a
+  later success clears it. 4xx (caller errors) never open it.
+- **Recovery self-probe.** While the breaker is open, an in-process probe (a
+  synthetic tone, no network) retries every `ENGINE_PROBE_SECONDS` and
+  auto-clears the breaker on success — no manual restart.
+- **`silero-vad` and `numpy`** added to `requirements.txt`.
+
+### Changed
+
+- **Correct HTTP status codes instead of a blanket `500`:** oversized upload
+  → `413` (`MAX_FILESIZE_MB`, default 250), text over the model's context →
+  `413`, GPU out-of-memory → `503` (busy, not broken; excluded from the
+  breaker), malformed JSON → `400`.
+- **`/health`**: replaced the `routing` block and `smart_routing` object with
+  a single `pool` object (raw queue/worker/VRAM stats, no fleet load signal);
+  added `metrics.consecutive_engine_failures` and `limits.max_filesize_mb`.
+
+### Removed
+
+- **The optional external self-registration hook** and the per-node load
+  metric. This server is now standalone — one process, an OpenAI-compatible
+  API and a `/health`. Run one, or run several behind any load balancer.
+  Dropped `redis` from `requirements.txt`.
+
 ## [2.4.1] - 2026-04-21
 
 ### Fixed
@@ -63,8 +107,6 @@ endpoints unchanged.
   - `uttera_stt_work_queue_depth` — Gauge
   - `uttera_stt_work_queue_audio_seconds` — Gauge, for drain-time
     estimate
-  - `uttera_stt_load_score` — Gauge in `[0.0, 1.0]`, saturation
-    signal the gatekeeper's router already uses
   - `uttera_stt_hot_ema_sps` — Gauge, rolling EMA of hot-lane
     seconds-of-audio-per-second-of-wall-time
   - `uttera_stt_vram_free_gb` — Gauge
@@ -117,9 +159,8 @@ endpoints unchanged.
 - **Default port migrated from `5000` → `9005`.** Formalising the
   canonical Uttera-stack port scheme: all Speech-to-Text backends
   (both `uttera-stt-hotcold` and `uttera-stt-vllm`) now default to
-  port `9005`, and all Text-to-Speech backends default to `9004`.
-  The Gatekeeper and clients can route by service family without
-  knowing which backend is behind it.
+  port `9005`, and all Text-to-Speech backends default to `9004`, so
+  the two STT backends are drop-in swappable behind a reverse proxy.
 
   **Why move off `5000`:**
   - Known collision with **macOS AirPlay Receiver** (since Monterey).
@@ -143,7 +184,7 @@ endpoints unchanged.
 
 No code change is required for existing deployments that override
 `PORT` via env var. For deployments running on the old default:
-- **If the Gatekeeper was pointing at `:5000`:** repoint it at `:9005`.
+- **If your reverse proxy was pointing at `:5000`:** repoint it at `:9005`.
 - **If you need to keep `:5000`:** set `PORT=5000` in the server's env.
 - **Docker users:** update your `-p` flag or `docker-compose.yml`.
 
@@ -293,7 +334,7 @@ English. Matches the behaviour landed in
 ### Validated
 End-to-end smoke test on a fresh clone of this tag (`v2.1.0`) with
 `WHISPER_MODEL=turbo` and LibreTranslate at
-`http://sphinx:5200`. Every case returns HTTP 200 and the expected
+`http://localhost:5200`. Every case returns HTTP 200 and the expected
 body:
 
 1. `to_language=en`, LibreTranslate on → English text.
@@ -362,11 +403,9 @@ long-overdue `SERVER_VERSION` re-sync.
 ## [1.6.7] - 2026-04-10
 
 ### Added
-- **Redis self-registration:** Each tick of `_cold_pool_manager` publishes
-  `{load_score, accepts_requests, host, port, version, ts}` to `stt:nodes:{NODE_ID}`
-  with TTL = 3 × pool manager interval. Opt-in via `REDIS_URL` env var; silently disabled
-  if unset or unreachable. Key deleted on clean shutdown. Adds `redis[asyncio]>=5.0.0`
-  to requirements.
+- **(superseded)** An optional external self-registration hook, opt-in via an
+  env var and silently disabled when unset. Removed in 2.5.0 — this server is
+  standalone; see that entry.
 
 ### Changed
 - **Dependency pins:** `torch>=2.9.0,<2.10.0`, `torchaudio>=2.9.0,<2.10.0` added to
@@ -376,10 +415,9 @@ long-overdue `SERVER_VERSION` re-sync.
 ## [1.6.6] - 2026-04-10
 
 ### Added
-- **Routing fields in `/health`:** `routing.load_score` (0–1, based on queue drain estimate
-  divided by `ROUTING_DRAIN_CAP_SECONDS`, default 120) and `routing.accepts_requests`
-  (false when model not loaded, errored, or score = 1.0). Designed for front-end router
-  (OpenResty Gatekeeper) node selection.
+- **(superseded)** A per-node load metric on `/health` for front-end router
+  selection. Removed in 2.5.0 — `/health` now reports readiness plus raw
+  queue/worker/VRAM stats only.
 
 ## [1.6.5] - 2026-04-10
 
@@ -551,7 +589,7 @@ long-overdue `SERVER_VERSION` re-sync.
 ## [1.3.5] - 2026-04-03
 
 ### Fixed
-- **Cold Lane fails with `No such file or directory` on non-sphinx installs:** `VENV_PYTHON` and `WHISPER_SCRIPT` now auto-detect `venv/bin/python` and `venv/bin/whisper` relative to `BASE_DIR` before falling back to the hardcoded sphinx paths. Resolution order: env var → local venv → sphinx fallback.
+- **Cold Lane fails with `No such file or directory` when the venv is elsewhere:** `VENV_PYTHON` and `WHISPER_SCRIPT` now auto-detect `venv/bin/python` and `venv/bin/whisper` relative to `BASE_DIR` before falling back to the hardcoded default paths. Resolution order: env var → local venv → default fallback.
 
 ## [1.3.4] - 2026-04-03
 
@@ -561,7 +599,7 @@ long-overdue `SERVER_VERSION` re-sync.
 ## [1.3.3] - 2026-04-03
 
 ### Changed
-- **`VENV_PYTHON` and `WHISPER_SCRIPT` now configurable via env vars:** Both paths can be overridden in `.env` without modifying source code. Hardcoded values remain as fallback for the canonical sphinx installation.
+- **`VENV_PYTHON` and `WHISPER_SCRIPT` now configurable via env vars:** Both paths can be overridden in `.env` without modifying source code. Hardcoded values remain as a fallback for the default installation layout.
 
 ## [1.3.2] - 2026-04-03
 

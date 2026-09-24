@@ -82,29 +82,28 @@ Transcribes audio in any language and translates it to a target language.
 
 ### `GET /health` and `HEAD /health`
 
-Returns server liveness and hot worker status. Both methods are
-accepted — `HEAD` returns the same headers as `GET` with an empty
-body, useful for uptime probes that don't want to parse JSON.
+Returns server liveness and hot worker status. Responds `200` when the
+engine is ready, `503` while the model loads or the circuit breaker is
+open. Both methods are accepted — `HEAD` returns the same headers as
+`GET` with an empty body, useful for uptime probes that don't want to
+parse JSON.
 
 **Example Response:**
 ```json
 {
   "status": "ok",
-  "version": "2.3.0",
+  "version": "2.5.0",
   "model": "medium",
   "hot_worker_loaded": true,
   "hot_worker_error": null,
-  "routing": {
-    "load_score": 0.0,
-    "accepts_requests": true
-  },
-  "smart_routing": {
+  "engine_error": null,
+  "limits": {"max_filesize_mb": 250},
+  "pool": {
     "ema_sps": 12.5,
     "cold_start_calibrated": true,
     "cold_ema_start_seconds": 8.2,
     "queue_depth": 0,
     "queue_audio_seconds": 0.0,
-    "queue_drain_estimate_seconds": 0.0,
     "pool_workers_active": 0,
     "pool_workers_loading": 0,
     "pool_workers_optimal": 0,
@@ -115,10 +114,15 @@ body, useful for uptime probes that don't want to parse JSON.
     "cold_start_configured_seconds": 10.0,
     "safety_factor": 1.3,
     "min_cold_vram_gb": 4.0,
-    "cold_vram_per_worker_gb": 1.8
+    "cold_vram_per_worker_gb": 1.8,
+    "consecutive_engine_failures": 0
   }
 }
 ```
+
+`engine_error` carries the reason when the circuit breaker has opened on
+repeated engine failures; the endpoint then returns `503` until the engine
+recovers (a success or the recovery self-probe clears it).
 
 ### `GET /v1/models`
 
@@ -182,8 +186,7 @@ curl -X POST "http://localhost:9005/v1/audio/translations" \
 ## 5. CORS
 
 Disabled by default — this server is API-first, typically consumed
-by backend-to-backend callers or served through the Uttera
-gatekeeper.
+by backend-to-backend callers or served behind a reverse proxy.
 
 To enable browser-origin access, set `CORS_ALLOW_ORIGINS` to a
 comma-separated list of origins (or `*` for permissive):
@@ -202,6 +205,6 @@ can be read from JavaScript.
 
 ## 6. Authentication
 
-No authentication in this repo by design. Deploy behind the Uttera
-gatekeeper (or any reverse proxy) for API keys, quotas, and rate
+No authentication in this repo by design. Deploy behind a reverse
+proxy or API gateway for API keys, quotas, and rate
 limits.

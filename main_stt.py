@@ -11,11 +11,34 @@
 # See LICENSE and NOTICE for full terms and attributions.
 #
 # Package: uttera-stt-hotcold
-# Version: 2.4.1
+# Version: 2.5.0
 # Maintainer: Uttera, Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
+# - 2.5.0 (2026-09-24): Robustness sweep + standalone. Five additions, all
+#   env-gated and safe by default:
+#   1. Optional frozen-model mode: set UTTERA_OFFLINE=1 and the server sets
+#      HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE / MODELSCOPE_OFFLINE before the ML
+#      imports, so a validated model never silently re-downloads or changes on
+#      a reboot. Online by default (a fresh install can fetch its model).
+#   2. Voice-activity gate (Silero, CPU): returns an empty transcription for
+#      clips with no speech, stopping Whisper hallucinating on silence. On any
+#      doubt it transcribes. Env: VAD_ENABLED, VAD_THRESHOLD, VAD_JIT,
+#      VAD_STRIDE. Needs `silero-vad`; disables itself if absent.
+#   3. Engine circuit breaker: N consecutive engine (5xx) failures make /health
+#      report 503; a later success clears it. Env: ENGINE_FAIL_THRESHOLD.
+#   4. Recovery self-probe (synthetic tone via httpx ASGITransport, no network)
+#      auto-clears the breaker when the engine recovers. Env: ENGINE_PROBE_SECONDS.
+#   5. Correct HTTP status codes: oversized upload / over-long text -> 413,
+#      GPU OOM -> 503 (excluded from the breaker), malformed JSON -> 400.
+#      Env: MAX_FILESIZE_MB (default 250).
+#   Removed: the optional external self-registration hook and the per-node
+#   load metric — this server is now standalone (one process, an OpenAI-
+#   compatible API, and a /health). /health dropped its `routing` block and
+#   gained metrics.consecutive_engine_failures; it now returns 503 when the
+#   engine is not ready or the breaker is open. Dropped redis from
+#   requirements; added silero-vad + numpy.
 # - 2.4.1 (2026-04-21): Fix module-load-time NameError introduced in
 #   2.4.0: the static gauge setters (_BUILD_INFO.labels(...).set(1),
 #   _LIBRETRANSLATE_CONFIGURED_GAUGE, _COLD_WORKER_POOL_CAP_GAUGE) were
@@ -27,7 +50,7 @@
 #   telemetry: requests_by_route_total{route}, cold_workers_active,
 #   cold_workers_loading, cold_workers_spawned_total,
 #   cold_worker_ema_start_seconds, work_queue_depth,
-#   work_queue_audio_seconds, load_score, vram_free_gb,
+#   work_queue_audio_seconds, vram_free_gb,
 #   vram_per_cold_worker_gb. Inference duration histogram gets
 #   lane-tagged ops: whisper_transcribe_hot vs
 #   whisper_transcribe_cold. Additive — all existing endpoints
@@ -47,7 +70,7 @@
 #   NODE_PORT defaults, API.md base URL. Migration for existing
 #   deployments: set `PORT=5000` (or the previous value) in your env
 #   if you need to preserve the old endpoint, otherwise point your
-#   Gatekeeper / reverse proxy at `:9005`. See also uttera-stt-vllm
+#   reverse proxy / load balancer at `:9005`. See also uttera-stt-vllm
 #   v1.3.0 (sibling sharing the same port).
 # - 2.2.1 (2026-04-18): /v1/models `owned_by` field now reports "uttera"
 #   instead of the stale "uttera-legacy" string left over from pre-rebrand.
@@ -110,15 +133,9 @@
 #   * OSS community files: HISTORY.md, AUTHORS.md, CODE_OF_CONDUCT.md,
 #     SECURITY.md, CODEOWNERS, CONTRIBUTING updates, etymology/backronym
 #     section in the README.
-# - 1.6.7 (2026-04-10): Redis self-registration. Each tick of _cold_pool_manager
-#   publishes {load_score, accepts_requests, host, port, version, ts} to
-#   stt:nodes:{NODE_ID} with TTL=3×interval. Opt-in via REDIS_URL env var;
-#   silently disabled if unset or unreachable. Key deleted on clean shutdown.
-#   Adds redis[asyncio]>=5.0.0 to requirements.txt.
-# - 1.6.6 (2026-04-10): Add routing.load_score and routing.accepts_requests to
-#   /health for front-end router support. load_score is drain_estimate/cap (0–1),
-#   accepts_requests is False when model not loaded, errored, or score=1.0.
-#   ROUTING_DRAIN_CAP_SECONDS env var (default 120) controls saturation threshold.
+# - 1.6.7 / 1.6.6 (2026-04-10): (superseded) added an optional external
+#   self-registration hook and a per-node load metric to /health. Both were
+#   removed in 2.5.0 — this server is standalone, see that entry.
 # - 1.6.5 (2026-04-10): Align /health schema with coqui-tts-local-server.
 #   Renamed work_queue_depth→queue_depth, work_queue_audio_seconds→queue_audio_seconds,
 #   work_queue_drain_estimate_seconds→queue_drain_estimate_seconds,
@@ -200,6 +217,21 @@
 # - 1.2.x (2026-02-27): DEBUG control.
 
 import io
+import os
+import sys
+import subprocess
+
+# --- Optional frozen-model (offline) mode ------------------------------------
+# ONLINE by default so a fresh install can fetch its model. Set UTTERA_OFFLINE=1
+# to pin the engine to the local cache, so a model you have already validated
+# can't silently re-download or change on a reboot. Applied BEFORE the ML
+# libraries import (they read these variables at import time). You can also set
+# HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE / MODELSCOPE_OFFLINE directly.
+if os.environ.get("UTTERA_OFFLINE", "0").lower() in ("1", "true", "yes"):
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("MODELSCOPE_OFFLINE", "1")
+
 import wave
 import time
 import base64
@@ -207,7 +239,6 @@ import torch
 import uvicorn
 import whisper
 import tempfile
-import os
 import asyncio
 import threading
 import json
@@ -227,7 +258,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Optional, Set
-import redis.asyncio as aioredis
 
 # Load .env from the project directory or its parent
 _base = os.path.dirname(os.path.abspath(__file__))
@@ -241,7 +271,7 @@ for _env_path in [os.path.join(_base, ".env"), os.path.join(os.path.dirname(_bas
 # 1. Global Config & Logging
 # -------------------------------
 
-SERVER_VERSION = "2.4.1"
+SERVER_VERSION = "2.5.0"
 
 # Valid response formats per OpenAI spec
 SUPPORTED_RESPONSE_FORMATS = {"json", "text", "srt", "vtt", "verbose_json"}
@@ -299,11 +329,6 @@ COLD_LANE_TIMEOUT_SECONDS = int(os.environ.get("COLD_LANE_TIMEOUT_SECONDS", "300
 
 MIN_COLD_VRAM_GB = float(os.environ.get("MIN_COLD_VRAM_GB", 4.0))
 
-# Drain time (seconds) considered 100% load for routing score. Requests with a
-# drain estimate at or above this cap receive load_score=1.0 and the node is
-# excluded from routing until the queue clears.
-ROUTING_DRAIN_CAP_SECONDS = float(os.environ.get("ROUTING_DRAIN_CAP_SECONDS", "120"))
-
 # LibreTranslate post-processing for /v1/audio/translations.
 # When this URL is set, /v1/audio/translations first transcribes with Whisper
 # (in whatever source language is detected) and then passes the text through
@@ -316,15 +341,32 @@ LIBRETRANSLATE_URL = os.environ.get("LIBRETRANSLATE_URL", "").rstrip("/")
 LIBRETRANSLATE_API_KEY = os.environ.get("LIBRETRANSLATE_API_KEY", "")
 LIBRETRANSLATE_TIMEOUT_S = float(os.environ.get("LIBRETRANSLATE_TIMEOUT_S", "30"))
 
-# Redis self-registration (opt-in). If REDIS_URL is unset, publishing is skipped.
-# NODE_ID defaults to HOST:PORT. TTL is set to 3× the pool manager interval so
-# the key expires automatically if the node dies or Redis becomes unreachable.
-REDIS_URL     = os.environ.get("REDIS_URL", "")
-REDIS_NODE_ID = os.environ.get("NODE_ID", "") or f"{os.environ.get('NODE_HOST', 'localhost')}:{os.environ.get('NODE_PORT', '9005')}"
-REDIS_NODE_HOST = os.environ.get("NODE_HOST", "localhost")
-REDIS_NODE_PORT = int(os.environ.get("NODE_PORT", "9005"))
-REDIS_KEY     = f"stt:nodes:{REDIS_NODE_ID}"
-REDIS_TTL     = max(2, int(COLD_POOL_MANAGER_INTERVAL * 3 + 1))  # seconds
+# Maximum upload size. A body larger than this is rejected with HTTP 413
+# (Payload Too Large) before it ever reaches the model. 413 is a client error
+# and does NOT count towards the engine circuit breaker.
+MAX_FILESIZE_MB = int(os.environ.get("MAX_FILESIZE_MB", "250"))
+
+# Engine circuit breaker: N consecutive engine (5xx) failures mark the server
+# not-ready so /health returns 503 instead of handing work to a dead engine. A
+# single later success clears it. Only 5xx count — 4xx are the caller's fault.
+ENGINE_FAIL_THRESHOLD = int(os.environ.get("ENGINE_FAIL_THRESHOLD", "3"))
+
+# Recovery self-probe: while the breaker is open, every ENGINE_PROBE_SECONDS the
+# server sends a tiny in-process request to itself; a 200 clears the breaker
+# automatically, without a manual restart.
+ENGINE_PROBE_SECONDS = int(os.environ.get("ENGINE_PROBE_SECONDS", "30"))
+
+# Voice-activity gate (VAD). Whisper hallucinates text on silence (it learned
+# "Thank you." / "Gracias." after quiet stretches from its subtitle training
+# data). The gate returns an empty transcription when the whole clip has no
+# speech; it never trims audio, and on any doubt it transcribes.
+VAD_ENABLED = os.environ.get("VAD_ENABLED", "1").lower() not in ("0", "false", "no")
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))
+# Path to the Silero JIT model. Empty = look inside the installed package.
+VAD_JIT = os.environ.get("VAD_JIT", "")
+# Window stride. Silero's window is 512 samples = 32 ms; stride 4 inspects
+# 32 ms out of every 128, which does not miss real speech.
+VAD_STRIDE = max(1, int(os.environ.get("VAD_STRIDE", "4")))
 
 COLD_START_TIME_SECONDS = float(os.environ.get("COLD_START_TIME_SECONDS", 8.0))
 
@@ -343,34 +385,30 @@ model_lock = threading.Lock()
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    global _work_queue, _cold_spawn_lock, _pool_worker_tasks, _redis
+    global _work_queue, _cold_spawn_lock, _pool_worker_tasks, _engine_probe_task
     _work_queue = asyncio.Queue()
     _cold_spawn_lock = asyncio.Lock()
     _pool_worker_tasks = set()
-
-    if REDIS_URL:
-        try:
-            _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
-            await _redis.ping()
-            print(f"Redis connected: {REDIS_URL} | key={REDIS_KEY} ttl={REDIS_TTL}s", flush=True)
-        except Exception as e:
-            print(f"Redis unavailable ({e}) — running without registration.", flush=True)
-            _redis = None
 
     await _warmup_ema()
     await _warmup_cold_ema()
 
     hot_task = asyncio.create_task(_hot_worker_loop())
     manager_task = asyncio.create_task(_cold_pool_manager())
+    # Recovery self-probe: clears the circuit breaker without a manual restart.
+    _engine_probe_task = asyncio.create_task(_engine_probe_loop())
 
     yield
 
     # Shutdown: cancel all worker tasks
     hot_task.cancel()
     manager_task.cancel()
+    if _engine_probe_task:
+        _engine_probe_task.cancel()
     for task in list(_pool_worker_tasks):
         task.cancel()
-    await asyncio.gather(hot_task, manager_task, *list(_pool_worker_tasks), return_exceptions=True)
+    await asyncio.gather(hot_task, manager_task, _engine_probe_task,
+                         *list(_pool_worker_tasks), return_exceptions=True)
 
     # Drain any remaining queued items (cancel their futures)
     while not _work_queue.empty():
@@ -381,15 +419,211 @@ async def _lifespan(application: FastAPI):
         except asyncio.QueueEmpty:
             break
 
-    if _redis:
-        try:
-            await _redis.delete(REDIS_KEY)
-        except Exception:
-            pass
-        await _redis.aclose()
-
 
 app = FastAPI(title="Uttera STT Server", version=SERVER_VERSION, lifespan=_lifespan)
+
+
+# ── The right status code, not a blanket 500 ────────────────────────────────
+# A 500 says "I broke". When the request is at fault, say so with a 4xx — and
+# it's not cosmetic: 5xx failures count towards the engine circuit breaker, so
+# a caller sending oversized text could otherwise trip it for everyone.
+#   · text over the model's context  -> 413 (was 500)
+#   · GPU OOM on a busy server        -> 503 (busy, not broken; excluded from
+#                                             the breaker, with Retry-After)
+import re as _re_err
+from fastapi.responses import JSONResponse as _ErrResp
+
+_SIGNS_TOO_LONG = ("max_model_len", "prompt_len", "context length", "too long",
+                   "maximum context", "exceeds")
+_SIGNS_OOM = ("out of memory", "outofmemoryerror", "cuda error: out of memory",
+              "cublas_status_alloc_failed")
+
+
+def _useful_line(exc) -> str:
+    """Pull the line that explains the limit and DROP the traceback (which would
+    leak internal paths and package names)."""
+    for line in reversed(str(exc).splitlines()):
+        low = line.lower()
+        if any(s in low for s in _SIGNS_TOO_LONG) and 'file "' not in low:
+            return _re_err.sub(r"^[A-Za-z_]+Error:\s*", "", line.strip())[:300]
+    return "the request exceeds the model's limit"
+
+
+def _classify_error(exc):
+    """Return (status, detail) by inspecting the error text, or (None, None)."""
+    t = str(exc).lower()
+    if any(s in t for s in _SIGNS_OOM):
+        return 503, "the server has no free memory right now; retry shortly"
+    if any(s in t for s in _SIGNS_TOO_LONG):
+        return 413, _useful_line(exc)
+    return None, None
+
+
+def _install_error_handlers(app):
+    @app.exception_handler(json.JSONDecodeError)
+    async def _on_json_error(request, exc):
+        return _ErrResp(status_code=400,
+                        content={"detail": "malformed JSON body: %s" % exc})
+
+    async def _on_generic_error(request, exc):
+        status, detail = _classify_error(exc)
+        if status == 503:
+            return _ErrResp(status_code=503, headers={"Retry-After": "30"},
+                            content={"detail": detail})
+        if status:
+            return _ErrResp(status_code=status, content={"detail": detail})
+        return _ErrResp(status_code=500,
+                        content={"detail": "%s: %s" % (type(exc).__name__, str(exc)[:300])})
+
+    app.add_exception_handler(ValueError, _on_generic_error)
+    app.add_exception_handler(RuntimeError, _on_generic_error)   # includes OutOfMemoryError
+
+
+_install_error_handlers(app)
+
+
+# ── Engine circuit breaker + recovery probe ─────────────────────────────────
+
+def _engine_is_ready() -> bool:
+    """The server is ready to serve when the hot worker is loaded, it has no
+    error, and the circuit breaker is closed."""
+    return whisper_model is not None and hot_worker_error is None and _breaker_error is None
+
+
+def _engine_failure(http_status: int, exc: Optional[Exception] = None) -> None:
+    """Count an engine failure. Open the breaker on reaching the threshold.
+
+    Only 5xx count; once N consecutive engine failures are seen /health serves
+    503 until a later success (or the recovery probe) clears it.
+    """
+    global _consecutive_engine_failures, _breaker_error
+    if http_status < 500:
+        return                      # caller's fault — the engine is fine
+    _consecutive_engine_failures += 1
+    if _consecutive_engine_failures >= ENGINE_FAIL_THRESHOLD and _breaker_error is None:
+        _breaker_error = ("circuit_breaker: %d consecutive engine failures; last: %s"
+                          % (_consecutive_engine_failures,
+                             f"{type(exc).__name__}: {exc}" if exc else "unknown"))[:300]
+        print("CIRCUIT BREAKER OPEN: %s — /health now reports unavailable" % _breaker_error,
+              file=sys.stderr, flush=True)
+
+
+def _engine_ok() -> None:
+    """A success clears the breaker and resets the count."""
+    global _consecutive_engine_failures, _breaker_error
+    _consecutive_engine_failures = 0
+    if _breaker_error is not None:
+        _breaker_error = None
+        print("CIRCUIT BREAKER CLOSED: the engine responds again",
+              file=sys.stderr, flush=True)
+
+
+def _probe_wav(seconds: float = 1.0, hz: int = 440, sr: int = 16000) -> bytes:
+    """A mono 16 kHz WAV holding a tone. A tone, not silence: pure silence can
+    make speech models fail, and a failing probe would keep the breaker open."""
+    import math
+    import struct
+    n = int(seconds * sr)
+    samples = b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * hz * i / sr)))
+                       for i in range(n))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sr)
+        f.writeframes(samples)
+    return buf.getvalue()
+
+
+async def _engine_probe_loop() -> None:
+    """While the engine is not ready, send a tiny in-process request every
+    ENGINE_PROBE_SECONDS. A 200 makes the endpoint call _engine_ok(), clearing
+    the breaker — no manual restart. In-process via httpx ASGITransport (no
+    network or open port)."""
+    import httpx
+    while True:
+        try:
+            await asyncio.sleep(ENGINE_PROBE_SECONDS)
+            if _engine_is_ready():
+                continue
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://probe",
+                                         timeout=120.0) as cli:
+                r = await cli.post("/v1/audio/transcriptions",
+                                   files={"file": ("probe.wav", _probe_wav(), "audio/wav")},
+                                   data={"model": "whisper-1"})
+            if r.status_code == 200:
+                print("probe: the engine responds again", file=sys.stderr, flush=True)
+            else:
+                print("probe: the engine is still down (HTTP %s)" % r.status_code,
+                      file=sys.stderr, flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("probe: failed to probe: %s" % e, file=sys.stderr, flush=True)
+
+
+# ── Voice-activity gate (VAD) ───────────────────────────────────────────────
+
+def _vad_loaded():
+    """The Silero JIT model, loaded by hand without importing `silero_vad`
+    (which would drag in onnxruntime). The model carries state and is not
+    thread-safe on one instance, hence the lock around every use."""
+    global _vad_model, _vad_broken
+    if _vad_model is not None or _vad_broken:
+        return _vad_model
+    with _vad_lock:
+        if _vad_model is None and not _vad_broken:
+            try:
+                path = VAD_JIT
+                if not path:
+                    import importlib.util as _u
+                    path = os.path.join(
+                        os.path.dirname(_u.find_spec("silero_vad").origin),
+                        "data", "silero_vad.jit")
+                _vad_model = torch.jit.load(path)
+                _vad_model.eval()
+                print("VAD: model loaded from %s (threshold %.2f)" % (path, VAD_THRESHOLD),
+                      file=sys.stderr, flush=True)
+            except Exception as e:
+                _vad_broken = True
+                print("VAD: unavailable (%s); transcribing everything, as before" % e,
+                      file=sys.stderr, flush=True)
+    return _vad_model
+
+
+def _to_16k(audio_bytes: bytes):
+    """The audio as float32 mono at 16 kHz via ffmpeg."""
+    import numpy as np
+    cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", "pipe:0",
+           "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", "16000", "pipe:1"]
+    p = subprocess.run(cmd, input=audio_bytes, capture_output=True, check=True)
+    return np.frombuffer(p.stdout, np.int16).flatten().astype("float32") / 32768.0
+
+
+def _no_voice(audio_bytes: bytes) -> bool:
+    """True ONLY if the detector asserts there is no speech anywhere. On any
+    doubt returns False and the audio is transcribed."""
+    if not VAD_ENABLED or _vad_loaded() is None:
+        return False
+    try:
+        pcm = _to_16k(audio_bytes)
+        if pcm.size < 512:
+            return False
+        m = _vad_model
+        with _vad_lock:            # a stateful instance: one thread at a time
+            m.reset_states()
+            with torch.no_grad():
+                for i in range(0, len(pcm) - 512, 512 * VAD_STRIDE):
+                    chunk = torch.from_numpy(pcm[i:i + 512]).unsqueeze(0)
+                    if float(m(chunk, 16000).item()) >= VAD_THRESHOLD:
+                        return False          # speech found
+        return True
+    except Exception as e:
+        print("VAD: could not decide (%s); transcribing" % e,
+              file=sys.stderr, flush=True)
+        return False
+
 
 # CORS middleware (disabled by default — API-first deployments don't need it).
 # Set CORS_ALLOW_ORIGINS to a comma-separated list of origins, or "*" to allow all.
@@ -489,8 +723,18 @@ _cold_spawn_lock: Optional[asyncio.Lock] = None
 # Set of asyncio Tasks running _pool_worker_loop (one per active pool worker).
 _pool_worker_tasks: Set[asyncio.Task] = set()
 
-# Redis client (None when REDIS_URL is not configured).
-_redis: Optional[aioredis.Redis] = None
+# Engine circuit breaker state. `_breaker_error` is set once the breaker opens
+# and forces /health to report unavailable until a success (or the probe) clears
+# it. Readiness = hot worker loaded AND no hot error AND breaker closed.
+_consecutive_engine_failures: int = 0
+_breaker_error: Optional[str] = None
+_engine_probe_task: Optional[asyncio.Task] = None
+
+# VAD state. The Silero model carries internal state and is NOT thread-safe on
+# a single instance, so every use is serialised under this lock.
+_vad_model = None
+_vad_broken: bool = False
+_vad_lock = threading.Lock()
 
 
 # -------------------------------
@@ -604,10 +848,6 @@ _WORK_QUEUE_AUDIO_SECONDS_GAUGE = Gauge(
     "uttera_stt_work_queue_audio_seconds",
     "Sum of audio durations waiting in the work queue (for drain-estimate latency)",
 )
-_LOAD_SCORE_GAUGE = Gauge(
-    "uttera_stt_load_score",
-    "Current load score in [0.0, 1.0]; 1.0 means the queue would take ROUTING_DRAIN_CAP_SECONDS or more to drain",
-)
 _HOT_EMA_SPS_GAUGE = Gauge(
     "uttera_stt_hot_ema_sps",
     "Rolling EMA of the hot worker's seconds-of-audio per second of wall-time (throughput proxy)",
@@ -640,24 +880,6 @@ _KNOWN_ENDPOINTS = {
     "/health",
     "/metrics",
 }
-
-
-async def _publish_to_redis(load_score: float, accepts: bool) -> None:
-    """Publish this node's routing state to Redis. Fails silently if unavailable."""
-    if _redis is None:
-        return
-    try:
-        payload = json.dumps({
-            "load_score":       load_score,
-            "accepts_requests": accepts,
-            "host":             REDIS_NODE_HOST,
-            "port":             REDIS_NODE_PORT,
-            "version":          SERVER_VERSION,
-            "ts":               time.time(),
-        })
-        await _redis.set(REDIS_KEY, payload, ex=REDIS_TTL)
-    except Exception:
-        pass  # Redis unavailability must never affect request serving
 
 
 @dataclasses.dataclass
@@ -1085,8 +1307,7 @@ async def _cold_pool_manager() -> None:
     Every COLD_POOL_MANAGER_INTERVAL seconds, computes _optimal_cold_workers() and spawns
     one more worker (serially, via _cold_spawn_lock) if active+loading < optimal.
     Each spawned worker runs as an independent _pool_worker_loop Task consuming from
-    _work_queue alongside the hot worker. Also publishes routing state to Redis on
-    every tick (no-op when REDIS_URL is not configured).
+    _work_queue alongside the hot worker.
     """
     while True:
         await asyncio.sleep(COLD_POOL_MANAGER_INTERVAL)
@@ -1122,15 +1343,6 @@ async def _cold_pool_manager() -> None:
             except Exception as e:
                 print(f"--- POOL MGR: spawn failed: {e} ---", flush=True)
 
-        # Publish routing state to Redis on every tick (no-op if not configured).
-        drain = (_work_queue_audio_seconds * _hot_ema_sps) if _hot_ema_sps else None
-        if drain is not None:
-            load_score = round(min(drain / ROUTING_DRAIN_CAP_SECONDS, 1.0), 3)
-        else:
-            load_score = round(min(_work_queue_audio_seconds / ROUTING_DRAIN_CAP_SECONDS, 1.0), 3)
-        accepts = whisper_model is not None and hot_worker_error is None and load_score < 1.0
-        await _publish_to_redis(load_score, accepts)
-
 
 # -------------------------------
 # 4. Endpoints
@@ -1149,20 +1361,13 @@ async def list_models():
 async def health_check():
     _free = _free_vram_gb()
     optimal = _optimal_cold_workers()
-    drain = round(_work_queue_audio_seconds * _hot_ema_sps, 2) if _hot_ema_sps else None
-    if drain is not None:
-        load_score = round(min(drain / ROUTING_DRAIN_CAP_SECONDS, 1.0), 3)
-    else:
-        # Not yet calibrated — use audio seconds as rough proxy (120s queued ≈ saturated)
-        load_score = round(min(_work_queue_audio_seconds / ROUTING_DRAIN_CAP_SECONDS, 1.0), 3)
-    accepts = whisper_model is not None and hot_worker_error is None and load_score < 1.0
-    routing_stats = {
+    ready = _engine_is_ready()
+    pool_stats = {
         "ema_sps": round(_hot_ema_sps, 4) if _hot_ema_sps is not None else None,
         "cold_start_calibrated": _cold_ema_start_stt is not None,
         "cold_ema_start_seconds": round(_cold_ema_start_stt, 2) if _cold_ema_start_stt is not None else None,
         "queue_depth": _work_queue.qsize() if _work_queue is not None else 0,
         "queue_audio_seconds": round(_work_queue_audio_seconds, 2),
-        "queue_drain_estimate_seconds": drain,
         "pool_workers_active": len(_pool_worker_tasks),
         "pool_workers_loading": _cold_workers_in_flight,
         "pool_workers_optimal": optimal,
@@ -1174,19 +1379,19 @@ async def health_check():
         "safety_factor": HOT_QUEUE_SAFETY_FACTOR,
         "min_cold_vram_gb": MIN_COLD_VRAM_GB,
         "cold_vram_per_worker_gb": round(_vram_per_cold_worker(), 3),
+        "consecutive_engine_failures": _consecutive_engine_failures,
     }
-    return {
-        "status": "ok",
+    body = {
+        "status": "ok" if ready else "starting",
         "version": SERVER_VERSION,
         "model": model_name,
         "hot_worker_loaded": whisper_model is not None,
         "hot_worker_error": hot_worker_error,
-        "routing": {
-            "load_score": load_score,
-            "accepts_requests": accepts,
-        },
-        "smart_routing": routing_stats,
+        "engine_error": _breaker_error,
+        "limits": {"max_filesize_mb": MAX_FILESIZE_MB},
+        "pool": pool_stats,
     }
+    return JSONResponse(status_code=200 if ready else 503, content=body)
 
 
 def _refresh_gauges_from_state() -> None:
@@ -1196,17 +1401,13 @@ def _refresh_gauges_from_state() -> None:
     current without hooking every state-change site. Mirrors what
     `health_check()` computes.
     """
-    _ENGINE_READY_GAUGE.set(1 if whisper_model is not None and hot_worker_error is None else 0)
+    _ENGINE_READY_GAUGE.set(1 if _engine_is_ready() else 0)
     _COLD_WORKERS_ACTIVE_GAUGE.set(len(_pool_worker_tasks))
     _COLD_WORKERS_LOADING_GAUGE.set(_cold_workers_in_flight)
     _WORK_QUEUE_DEPTH_GAUGE.set(_work_queue.qsize() if _work_queue is not None else 0)
     _WORK_QUEUE_AUDIO_SECONDS_GAUGE.set(_work_queue_audio_seconds)
     if _hot_ema_sps is not None:
         _HOT_EMA_SPS_GAUGE.set(_hot_ema_sps)
-        drain = _work_queue_audio_seconds * _hot_ema_sps
-        _LOAD_SCORE_GAUGE.set(min(drain / ROUTING_DRAIN_CAP_SECONDS, 1.0))
-    else:
-        _LOAD_SCORE_GAUGE.set(min(_work_queue_audio_seconds / ROUTING_DRAIN_CAP_SECONDS, 1.0))
     if _cold_ema_start_stt is not None:
         _COLD_EMA_START_GAUGE.set(_cold_ema_start_stt)
     _free = _free_vram_gb()
@@ -1223,9 +1424,9 @@ async def metrics():
 
     Exposes both the generic HTTP-level metrics (tracked via the
     middleware) and this server's hot/cold-specific pool telemetry
-    (cold workers active/loading/spawned, queue depth, VRAM, load
-    score). Cardinality is bounded by design — no per-request-id
-    labels, no language labels, no voice labels.
+    (cold workers active/loading/spawned, queue depth, VRAM).
+    Cardinality is bounded by design — no per-request-id labels, no
+    language labels, no voice labels.
 
     Scrape with Telegraf's `inputs.prometheus`, Prometheus itself,
     or any OpenMetrics-compatible consumer.
@@ -1340,6 +1541,12 @@ async def create_transcription(
     req_t0 = time.monotonic()
     try:
         contents = await file.read()
+        # 413, not 400: the file is valid, it just doesn't fit. A 4xx doesn't
+        # count towards the circuit breaker.
+        _mb = len(contents) / 1048576
+        if _mb > MAX_FILESIZE_MB:
+            raise HTTPException(status_code=413,
+                                detail=f"File is {_mb:.0f} MB; the limit is {MAX_FILESIZE_MB} MB.")
         try:
             audio_dur = _get_audio_duration(contents)
         except Exception as e:
@@ -1350,6 +1557,14 @@ async def create_transcription(
                 status_code=400,
                 detail=f"Failed to decode audio: {type(e).__name__}: {str(e)[:200]}",
             )
+
+        # Voice-activity gate, BEFORE occupying a worker: with no speech there
+        # is nothing to transcribe and we save the GPU.
+        if await asyncio.to_thread(_no_voice, contents):
+            print("VAD: no speech; the model is not called", file=sys.stderr, flush=True)
+            _engine_ok()
+            return _render_response({"text": "", "segments": [], "language": ""},
+                                    response_format, "VAD-SKIP")
 
         global _work_queue_audio_seconds
         loop = asyncio.get_running_loop()
@@ -1376,6 +1591,7 @@ async def create_transcription(
         ).inc(audio_dur)
         op = "whisper_transcribe_cold" if route in ("COLD-POOL",) else "whisper_transcribe_hot"
         _INFERENCE_DURATION.labels(op=op).observe(time.monotonic() - req_t0)
+        _engine_ok()
         return _render_response(res, response_format, route)
     except HTTPException:
         raise
@@ -1406,6 +1622,7 @@ async def create_transcription(
             )
         _ERRORS_TOTAL.labels(type="model").inc()
         print(f"ERROR in create_transcription: {e}", flush=True)
+        _engine_failure(500, e)
         raise HTTPException(status_code=500, detail="Transcription failed. Check server logs.")
     finally:
         _INFLIGHT_GAUGE.dec()
@@ -1497,6 +1714,10 @@ async def create_translation(
 
     try:
         contents = await file.read()
+        _mb = len(contents) / 1048576
+        if _mb > MAX_FILESIZE_MB:
+            raise HTTPException(status_code=413,
+                                detail=f"File is {_mb:.0f} MB; the limit is {MAX_FILESIZE_MB} MB.")
         try:
             audio_dur = _get_audio_duration(contents)
         except Exception as e:
@@ -1534,6 +1755,9 @@ async def create_translation(
         ).inc(audio_dur)
         _op_whisper = "whisper_transcribe_cold" if route in ("COLD-POOL",) else "whisper_transcribe_hot"
         _INFERENCE_DURATION.labels(op=_op_whisper).observe(time.monotonic() - whisper_t0)
+        # The transcription (the engine step) succeeded — clear the breaker
+        # regardless of what the LibreTranslate step does next.
+        _engine_ok()
 
         # Legacy path: no LibreTranslate, return Whisper native translation.
         if not LIBRETRANSLATE_URL:
@@ -1593,6 +1817,7 @@ async def create_translation(
             )
         _ERRORS_TOTAL.labels(type="model").inc()
         print(f"ERROR in create_translation: {e}", flush=True)
+        _engine_failure(500, e)
         raise HTTPException(status_code=500, detail="Translation failed. Check server logs.")
     finally:
         _INFLIGHT_GAUGE.dec()
