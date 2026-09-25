@@ -218,6 +218,7 @@
 
 import io
 import os
+import re
 import sys
 import subprocess
 
@@ -430,8 +431,6 @@ app = FastAPI(title="Uttera STT Server", version=SERVER_VERSION, lifespan=_lifes
 #   · text over the model's context  -> 413 (was 500)
 #   · GPU OOM on a busy server        -> 503 (busy, not broken; excluded from
 #                                             the breaker, with Retry-After)
-import re as _re_err
-from fastapi.responses import JSONResponse as _ErrResp
 
 _SIGNS_TOO_LONG = ("max_model_len", "prompt_len", "context length", "too long",
                    "maximum context", "exceeds")
@@ -445,7 +444,7 @@ def _useful_line(exc) -> str:
     for line in reversed(str(exc).splitlines()):
         low = line.lower()
         if any(s in low for s in _SIGNS_TOO_LONG) and 'file "' not in low:
-            return _re_err.sub(r"^[A-Za-z_]+Error:\s*", "", line.strip())[:300]
+            return re.sub(r"^[A-Za-z_]+Error:\s*", "", line.strip())[:300]
     return "the request exceeds the model's limit"
 
 
@@ -462,17 +461,17 @@ def _classify_error(exc):
 def _install_error_handlers(app):
     @app.exception_handler(json.JSONDecodeError)
     async def _on_json_error(request, exc):
-        return _ErrResp(status_code=400,
+        return JSONResponse(status_code=400,
                         content={"detail": "malformed JSON body: %s" % exc})
 
     async def _on_generic_error(request, exc):
         status, detail = _classify_error(exc)
         if status == 503:
-            return _ErrResp(status_code=503, headers={"Retry-After": "30"},
+            return JSONResponse(status_code=503, headers={"Retry-After": "30"},
                             content={"detail": detail})
         if status:
-            return _ErrResp(status_code=status, content={"detail": detail})
-        return _ErrResp(status_code=500,
+            return JSONResponse(status_code=status, content={"detail": detail})
+        return JSONResponse(status_code=500,
                         content={"detail": "%s: %s" % (type(exc).__name__, str(exc)[:300])})
 
     app.add_exception_handler(ValueError, _on_generic_error)
