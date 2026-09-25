@@ -12,7 +12,7 @@
 #
 # Package: uttera-stt-hotcold
 # Version: 2.5.0
-# Maintainer: Uttera, Hugo L. Espuny
+# Maintainer: Hugo L. Espuny
 # Description: High-performance STT server with GPU acceleration and concurrency.
 #
 # CHANGELOG:
@@ -73,7 +73,7 @@
 #   reverse proxy / load balancer at `:9005`. See also uttera-stt-vllm
 #   v1.3.0 (sibling sharing the same port).
 # - 2.2.1 (2026-04-18): /v1/models `owned_by` field now reports "uttera"
-#   instead of the stale "uttera-legacy" string left over from pre-rebrand.
+#   instead of a stale pre-rebrand value.
 #   Cosmetic only — the field is free-form in the OpenAI spec, so no
 #   client compatibility impact.
 # - 2.2.0 (2026-04-17): OpenAI-compat polish sweep. Seven endpoint/feature
@@ -116,8 +116,8 @@
 #   * Rebranded from "Whisper STT Server" to Uttera. Repository moved to
 #     github.com/uttera/uttera-stt-hotcold. README, banner, docs, systemd
 #     unit names, FastAPI app title ("Uttera STT Server"), Dockerfile
-#     and compose all updated. Personal donation addresses and Stark
-#     Fleet artifacts removed.
+#     and compose all updated. Personal donation addresses and pre-rebrand
+#     artifacts removed.
 #   * License changed to Apache-2.0. OpenAI Whisper weights remain under
 #     their upstream MIT license.
 #   Changed:

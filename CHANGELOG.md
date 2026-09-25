@@ -197,7 +197,7 @@ No code change is required for existing deployments that override
 ## [2.2.1] - 2026-04-18
 
 ### Changed
-- `/v1/models` now reports `owned_by: "uttera"` (was: `"uttera-legacy"`,
+- `/v1/models` now reports `owned_by: "uttera"` (was: a stale pre-rebrand value,
   a stale string left over from the pre-rebrand release). The field
   is free-form in the OpenAI spec, so no client compatibility impact.
 
@@ -365,7 +365,7 @@ long-overdue `SERVER_VERSION` re-sync.
 - **Project rebranded to Uttera.** Repository moved to
   `https://github.com/uttera/uttera-stt-hotcold`. README, banner, docs,
   and FastAPI app title updated to "Uttera STT Server". Legacy clone
-  URLs, systemd unit names, and Uttera / personal-donation artifacts
+  URLs, systemd unit names, and pre-rebrand / personal-donation artifacts
   removed.
 - **License changed to Apache-2.0** (was unlicensed / proprietary in
   earlier releases). See `LICENSE` and `NOTICE`. The OpenAI Whisper
